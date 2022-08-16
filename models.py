@@ -5,6 +5,7 @@ import torch.nn as nn
 from functools import partial
 
 from evit import EViT, _cfg
+# from evit_l import EViT_l, _cfg
 
 from timm.models.registry import register_model
 from timm.models.layers import trunc_normal_

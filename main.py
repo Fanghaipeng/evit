@@ -29,11 +29,28 @@ from samplers import RASampler
 import models
 import utils
 from helpers import speed_test, get_macs
+import evit.evit_select as evit_select
+
+import evit_l2
+import evit_l2n
+import evit_l2g
+import evit_l2w
+import evit_l2n3
+import evit_l2n6
+import evit_l2n9
+import evit_l2n3p
+import evit_l2ng
+import evit_l2ng_bmm   
+
+import evit_l3
+import evit_l3n
+import evit_l3g
+import evit_l3w
+import evit_l3wg
 
 from tensorboardX import SummaryWriter
 import warnings
 warnings.filterwarnings('ignore', 'Argument interpolation should be of type InterpolationMode instead of int')
-
 
 def get_args_parser():
     parser = argparse.ArgumentParser('DeiT training and evaluation script', add_help=False)
@@ -46,7 +63,7 @@ def get_args_parser():
     parser.add_argument('--fuse_token', action='store_true', help='whether to fuse the inattentive tokens')
     parser.add_argument('--base_keep_rate', type=float, default=0.7,
                         help='Base keep rate (default: 0.7)')
-    parser.add_argument('--shrink_epochs', default=0, type=int, 
+    parser.add_argument('--shrink_epochs', default=100, type=int, 
                         help='how many epochs to perform gradual shrinking of inattentive tokens')
     parser.add_argument('--shrink_start_epoch', default=10, type=int, 
                         help='on which epoch to start shrinking of inattentive tokens')
@@ -54,7 +71,7 @@ def get_args_parser():
                         help='the layer indices for shrinking inattentive tokens')
 
     # Model parameters
-    parser.add_argument('--model', default='deit_base_patch16_224', type=str, metavar='MODEL',
+    parser.add_argument('--model', default='deit_small_patch16_224', type=str, metavar='MODEL',
                         help='Name of model to train')
     parser.add_argument('--input-size', default=224, type=int, help='images input size')
 
@@ -159,7 +176,7 @@ def get_args_parser():
     parser.add_argument('--finetune', default='', help='finetune from checkpoint')
 
     # Dataset parameters
-    parser.add_argument('--data-path', default='/datasets01/imagenet_full_size/061417/', type=str,
+    parser.add_argument('--data-path', default='/apsarapangu/disk2/fanghaipeng.fhp/CVPR/data/imagenet/', type=str,
                         help='dataset path')
     parser.add_argument('--data-set', default='IMNET', choices=['CIFAR', 'IMNET', 'INAT', 'INAT19'],
                         type=str, help='Image Net dataset path')
@@ -462,7 +479,7 @@ def main(args):
                     'args': args,
                 }, checkpoint_path)
 
-        test_interval = 30
+        test_interval = 1
         if epoch % test_interval == 0 or epoch == args.epochs - 1:
             test_stats = evaluate(data_loader_val, model, device, keep_rate)
             print(f"Accuracy of the network on the {len(dataset_val)} test images: {test_stats['acc1']:.1f}%")
@@ -471,6 +488,10 @@ def main(args):
             test_stats1 = {f'test_{k}': v for k, v in test_stats.items()}
         else:
             test_stats1 = {}
+            
+        for name,p in model.named_parameters():
+            if "gamma" in name:
+                print(name,p[0])
 
         log_stats = {**{f'train_{k}': v for k, v in train_stats.items()},
                      **test_stats1,

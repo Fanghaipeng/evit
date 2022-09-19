@@ -45,6 +45,39 @@ from helpers import complement_idx
 
 _logger = logging.getLogger(__name__)
 
+
+from typing import Any, Callable, List, Optional, Union
+from numbers import Number
+from fvcore.nn import FlopCountAnalysis
+import numpy as np
+
+def rfft_flop_jit(inputs: List[Any], outputs: List[Any]) -> Number:
+    """
+    Count flops for the rfft/rfftn operator.
+    """
+    input_shape = inputs[0].type().sizes()
+    B, H, W, C = input_shape
+    N = H * W
+    flops = N * C * np.ceil(np.log2(N))
+    return flops
+
+def calc_flops(model, img_size=224, show_details=False, ratios=None):
+    with torch.no_grad():
+        x = torch.randn(1, 3, img_size, img_size).cuda()
+        model.default_ratio = ratios
+        fca1 = FlopCountAnalysis(model, x)
+        handlers = {
+            'aten::fft_rfft2': rfft_flop_jit,
+            'aten::fft_irfft2': rfft_flop_jit,
+        }
+        fca1.set_op_handle(**handlers)
+        flops1 = fca1.total()
+        if show_details:
+            print(fca1.by_module())
+        print("#### GFLOPs: {} for ratio {}".format(flops1 / 1e9, ratios))
+    return flops1 / 1e9
+    
+    
 def batch_index_select(x, idx):
     if len(x.size()) == 3:
         
@@ -649,7 +682,7 @@ def _create_evit(variant, pretrained=False, default_cfg=None, **kwargs):
 # -------------------------------------------------------------
 # EViT prototype models
 @register_model
-def deit_small_patch16_shrink_base_l(pretrained=False, base_keep_rate=0.7, drop_loc=(3, 6, 9), **kwargs):
+def deit_small_patch16_shrink_base_sl(pretrained=False, base_keep_rate=0.7, drop_loc=(3, 6, 9), **kwargs):
     keep_rate = [1] * 12
     for loc in drop_loc:
         keep_rate[loc] = base_keep_rate
@@ -660,7 +693,5 @@ def deit_small_patch16_shrink_base_l(pretrained=False, base_keep_rate=0.7, drop_
 
 if __name__ == "__main__":
 
-    model = deit_small_patch16_shrink_base_l(base_keep_rate=0.7).cuda()
-    img_size = 224
-    x = torch.randn(16, 3, img_size, img_size).cuda()
-    model(x)
+    model = deit_small_patch16_shrink_base_sl(base_keep_rate=0.7).cuda()
+    flops = calc_flops(model, img_size=224)

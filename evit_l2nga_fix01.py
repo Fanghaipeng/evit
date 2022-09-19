@@ -45,37 +45,16 @@ from helpers import complement_idx
 
 _logger = logging.getLogger(__name__)
 
-from typing import Any, Callable, List, Optional, Union
-from numbers import Number
-from fvcore.nn import FlopCountAnalysis
-import numpy as np
+def batch_index_select(x, idx):
+    if len(x.size()) == 3:
+        
+        B, N, C = x.size()
+        N_new = idx.size(1)
+        offset = torch.arange(B, dtype=torch.long, device=x.device).view(B, 1) * N
+        idx = idx + offset
+        out = x.reshape(B*N, C)[idx.reshape(-1)].reshape(B, N_new, C)
 
-def rfft_flop_jit(inputs: List[Any], outputs: List[Any]) -> Number:
-    """
-    Count flops for the rfft/rfftn operator.
-    """
-    input_shape = inputs[0].type().sizes()
-    B, H, W, C = input_shape
-    N = H * W
-    flops = N * C * np.ceil(np.log2(N))
-    return flops
-
-def calc_flops(model, img_size=224, show_details=False, ratios=None):
-    with torch.no_grad():
-        x = torch.randn(1, 3, img_size, img_size).cuda()
-        model.default_ratio = ratios
-        fca1 = FlopCountAnalysis(model, x)
-        handlers = {
-            'aten::fft_rfft2': rfft_flop_jit,
-            'aten::fft_irfft2': rfft_flop_jit,
-        }
-        fca1.set_op_handle(**handlers)
-        flops1 = fca1.total()
-        if show_details:
-            print(fca1.by_module())
-        print("#### GFLOPs: {} for ratio {}".format(flops1 / 1e9, ratios))
-    return flops1 / 1e9
-    
+        return out
 
 def _cfg(url='', **kwargs):
     return {
@@ -219,17 +198,47 @@ class Attention(nn.Module):
         self.proj_drop = nn.Dropout(proj_drop)
         self.keep_rate = keep_rate
         assert 0 < keep_rate <= 1, "keep_rate must > 0 and <= 1, got {0}".format(keep_rate)
-
-    def forward(self, x, keep_rate=None, tokens=None):
+        self.gamma = nn.Parameter(torch.tensor([0.5],requires_grad=True))
+        
+    #! def forward(self, x, keep_rate=None, tokens=None):
+    def forward(self, x, pos, keep_rate=None, tokens=None):
         if keep_rate is None:
             keep_rate = self.keep_rate
         B, N, C = x.shape
         qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
         q, k, v = qkv[0], qkv[1], qkv[2]   # make torchscript happy (cannot use tensor as tuple)
 
-        attn = (q @ k.transpose(-2, -1)) * self.scale
+        attn_f = (q @ k.transpose(-2, -1)) * self.scale
+
+        #! 无偏[CLS]
+        pos_without_cls = pos[:,1:,:]
+
+        c1 = torch.unsqueeze(pos_without_cls, dim=2)
+        c2 = torch.unsqueeze(pos_without_cls, dim=1)
+        mask = (torch.sum((c1 - c2)**2, dim=-1) + 1e-5) ** 0.5
+
+        each_mask_min = torch.min(torch.min(mask,dim=1).values,dim=1).values.detach().unsqueeze(1).unsqueeze(2)
+        each_mask_max = torch.max(torch.max(mask,dim=1).values,dim=1).values.detach().unsqueeze(1).unsqueeze(2)
+        each_mask_len = (each_mask_max - each_mask_min)
+        mask = 1 - (mask - each_mask_min)/each_mask_len
+
+        mask = torch.cat((torch.ones((B, 1, N-1),device=x.device), mask), dim = 1)
+        mask = torch.cat((torch.ones((B, N, 1),device=x.device), mask), dim = 2)
+
+        mask = mask.unsqueeze(1)
+        
+        #NOTE： attn 乘 v 时 加上权重
+        self.gamma.data.clamp_(0., 1.)
+        attn = (1 - self.gamma) * attn_f + self.gamma * mask
+        #! end
+
         attn = attn.softmax(dim=-1)
         attn = self.attn_drop(attn)
+
+        #! new for ps2
+        attn_mean = torch.mean(attn, dim=1)
+        pos = (attn_mean @ pos).detach()
+        #! end
 
         x = (attn @ v).transpose(1, 2).reshape(B, N, C)
         x = self.proj(x)
@@ -241,7 +250,7 @@ class Attention(nn.Module):
             if tokens is not None:
                 left_tokens = tokens
             if left_tokens == N - 1:
-                return x, None, None, None, left_tokens
+                return x, pos, None, None, None, left_tokens
             assert left_tokens >= 1
             cls_attn = attn[:, :, 0, 1:]  # [B, H, N-1]
             cls_attn = cls_attn.mean(dim=1)  # [B, N-1]
@@ -250,9 +259,9 @@ class Attention(nn.Module):
             # index = torch.cat([cls_idx, idx + 1], dim=1)
             index = idx.unsqueeze(-1).expand(-1, -1, C)  # [B, left_tokens, C]
 
-            return x, index, idx, cls_attn, left_tokens
+            return x, pos, index, idx, cls_attn, left_tokens
 
-        return  x, None, None, None, left_tokens
+        return  x, pos, None, None, None, left_tokens
 
 
 class Block(nn.Module):
@@ -273,34 +282,59 @@ class Block(nn.Module):
         self.mlp_hidden_dim = mlp_hidden_dim
         self.fuse_token = fuse_token
 
-    def forward(self, x, keep_rate=None, tokens=None, get_idx=False):
+    def forward(self, x, pos, keep_rate=None, tokens=None, get_idx=False):
         if keep_rate is None:
             keep_rate = self.keep_rate  # this is for inference, use the default keep rate
         B, N, C = x.shape
 
-        tmp, index, idx, cls_attn, left_tokens = self.attn(self.norm1(x), keep_rate, tokens)
+        # ! new for ps2
+        # tmp, index, idx, cls_attn, left_tokens = self.attn(self.norm1(x), keep_rate, tokens)
+        tmp, pos_tmp, index, idx, cls_attn, left_tokens = self.attn(self.norm1(x), pos, keep_rate, tokens)
+        pos = (pos + pos_tmp)/2
+        # ! new for ps2
+
         x = x + self.drop_path(tmp)
 
         if index is not None:
             # B, N, C = x.shape
             non_cls = x[:, 1:]
-            x_others = torch.gather(non_cls, dim=1, index=index)  # [B, left_tokens, C]
+            # x_others = torch.gather(non_cls, dim=1, index=index)  # [B, left_tokens, C]
 
+            # ! new for ps2
+            pos_non_cls = pos[:, 1:]
+            pos_others = batch_index_select(pos_non_cls, idx)
+            # ! new for ps2
+
+            x_others  = torch.gather(non_cls, dim=1, index=index)
             if self.fuse_token:
                 compl = complement_idx(idx, N - 1)  # [B, N-1-left_tokens]
-                non_topk = torch.gather(non_cls, dim=1, index=compl.unsqueeze(-1).expand(-1, -1, C))  # [B, N-1-left_tokens, C]
+                # non_topk = torch.gather(non_cls, dim=1, index=compl.unsqueeze(-1).expand(-1, -1, C))  # [B, N-1-left_tokens, C]
+                non_topk = batch_index_select(non_cls, compl) #[B, N-1-left_tokens, C]
+                # ! new for ps2
+                pos_non_topk = batch_index_select(pos_non_cls, compl)
+                # ! end
 
                 non_topk_attn = torch.gather(cls_attn, dim=1, index=compl)  # [B, N-1-left_tokens]
                 extra_token = torch.sum(non_topk * non_topk_attn.unsqueeze(-1), dim=1, keepdim=True)  # [B, 1, C]
+                # ! new for ps2
+                extra_pos = torch.sum(pos_non_topk * non_topk_attn.unsqueeze(-1), dim=1, keepdim=True)  # [B, 1, 2]
+                # ! end
+
                 x = torch.cat([x[:, 0:1], x_others, extra_token], dim=1)
+                # ! new for ps2
+                pos = torch.cat([pos[:, 0:1], pos_others, extra_pos], dim=1)
+                # ! end
             else:
                 x = torch.cat([x[:, 0:1], x_others], dim=1)
+                # ! new for ps2
+                pos = torch.cat([pos[:, 0:1], pos_others], dim=1)
+                # ! end
 
         x = x + self.drop_path(self.mlp(self.norm2(x)))
         n_tokens = x.shape[1] - 1
         if get_idx and index is not None:
             return x, n_tokens, idx
-        return x, n_tokens, None
+        return x, pos, n_tokens, None
 
 
 class EViT(nn.Module):
@@ -350,6 +384,13 @@ class EViT(nn.Module):
         self.patch_embed = embed_layer(
             img_size=img_size, patch_size=patch_size, in_chans=in_chans, embed_dim=embed_dim)
         num_patches = self.patch_embed.num_patches
+
+        # ! new for ps2
+        patches_h = int(img_size[0]/patch_size)
+        self.xpos = torch.cat((torch.Tensor([0.5]).cuda(),torch.arange(0, 1, 1/patches_h).cuda().reshape(-1,1).expand(-1,patches_h).reshape(-1)))
+        self.ypos = torch.cat((torch.Tensor([0.5]).cuda(),torch.arange(0, 1, 1/patches_h).cuda().reshape(1,-1).expand(patches_h,-1).reshape(-1)))
+
+        # ! end
 
         self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
         self.dist_token = nn.Parameter(torch.zeros(1, 1, embed_dim)) if distilled else None
@@ -454,10 +495,19 @@ class EViT(nn.Module):
 
         x = self.pos_drop(x + pos_embed)
 
+        # ! new for ps2
+        posx = self.xpos.view(1,-1,1).expand(x.shape[0], -1, -1)
+        posy = self.ypos.view(1,-1,1).expand(x.shape[0], -1, -1)
+        pos = torch.cat((posx,posy), dim=2)
+        # ! end
+
         left_tokens = []
         idxs = []
         for i, blk in enumerate(self.blocks):
-            x, left_token, idx = blk(x, keep_rate[i], tokens[i], get_idx)
+            # ! new for ps2
+            # x, left_token, idx = blk(x, keep_rate[i], tokens[i], get_idx)
+            x, pos, left_token, idx = blk(x, pos, keep_rate[i], tokens[i], get_idx)
+            # ! end
             left_tokens.append(left_token)
             if idx is not None:
                 idxs.append(idx)
@@ -665,30 +715,11 @@ def _create_evit(variant, pretrained=False, default_cfg=None, **kwargs):
     return model
 
 
-@register_model
-def deit_tiny_patch16_224(pretrained=False, **kwargs):
-    """ DeiT-tiny model @ 224x224 from paper (https://arxiv.org/abs/2012.12877).
-    ImageNet-1k weights from https://github.com/facebookresearch/deit.
-    """
-    model_kwargs = dict(patch_size=16, embed_dim=192, depth=12, num_heads=3, **kwargs)
-    model = _create_evit('deit_tiny_patch16_224', pretrained=pretrained, **model_kwargs)
-    return model
-
-
-@register_model
-def deit_small_patch16_224(pretrained=False, **kwargs):
-    """ DeiT-small model @ 224x224 from paper (https://arxiv.org/abs/2012.12877).
-    ImageNet-1k weights from https://github.com/facebookresearch/deit.
-    """
-    model_kwargs = dict(patch_size=16, embed_dim=384, depth=12, num_heads=6, **kwargs)
-    model = _create_evit('deit_small_patch16_224', pretrained=pretrained, **model_kwargs)
-    return model
-
 
 # -------------------------------------------------------------
 # EViT prototype models
 @register_model
-def deit_small_patch16_shrink_base(pretrained=False, base_keep_rate=0.7, drop_loc=(3, 6, 9), **kwargs):
+def deit_small_patch16_shrink_base_l2nga_fix01(pretrained=False, base_keep_rate=0.7, drop_loc=(3, 6, 9), **kwargs):
     keep_rate = [1] * 12
     for loc in drop_loc:
         keep_rate[loc] = base_keep_rate
@@ -697,83 +728,9 @@ def deit_small_patch16_shrink_base(pretrained=False, base_keep_rate=0.7, drop_lo
     model = _create_evit('deit_small_patch16_224', pretrained=pretrained, **model_kwargs)
     return model
 
-
-@register_model
-def deit_base_patch16_shrink_base(pretrained=False, base_keep_rate=0.7, drop_loc=(3, 6, 9), **kwargs):
-    keep_rate = [1] * 12
-    for loc in drop_loc:
-        keep_rate[loc] = base_keep_rate
-    model_kwargs = dict(patch_size=16, embed_dim=768, depth=12, num_heads=12, keep_rate=keep_rate)
-    model_kwargs.update(kwargs)
-    model = _create_evit('deit_base_patch16_224', pretrained=pretrained, **model_kwargs)
-    return model
-
-
-# -------------------------------------------------------------
-# Some example EViT models
-@register_model
-def deit_small_patch16_224_shrink_base(pretrained=False, base_keep_rate=0.7, **kwargs):
-    model_kwargs = dict(patch_size=16, embed_dim=384, depth=12, num_heads=6,
-                        keep_rate=(1, 1, 1, base_keep_rate) + (1, 1, base_keep_rate) + (1, 1, base_keep_rate) + (1, 1), **kwargs)
-    model = _create_evit('deit_small_patch16_224', pretrained=pretrained, **model_kwargs)
-    return model
-
-@register_model
-def deit_small_patch16_224_shrink(pretrained=False, base_keep_rate=0.5, **kwargs):
-    model_kwargs = dict(patch_size=16, embed_dim=384, depth=12, num_heads=6,
-                        keep_rate=(1, 1, 1, 0.7) + (1, 1, 0.7) + (1, 1, 0.7) + (1, 1), **kwargs)
-    model = _create_evit('deit_small_patch16_224', pretrained=pretrained, **model_kwargs)
-    return model
-
-@register_model
-def deit_small_patch16_272_shrink(pretrained=False, base_keep_rate=0.5, **kwargs):
-    model_kwargs = dict(patch_size=16, embed_dim=384, depth=12, num_heads=6,
-                        keep_rate=(1, 1, 1, 0.7) + (1, 1, 0.7) + (1, 1, 0.7) + (1, 1), **kwargs)
-    model = _create_evit('deit_small_patch16_272', pretrained=pretrained, **model_kwargs)
-    return model
-
-@register_model
-def deit_small_patch16_224_shrink05(pretrained=False, base_keep_rate=0.5, **kwargs):
-    model_kwargs = dict(patch_size=16, embed_dim=384, depth=12, num_heads=6,
-                        keep_rate=(1, 1, 1, 0.5) + (1, 1, 0.5) + (1, 1, 0.5) + (1, 1), **kwargs)
-    model = _create_evit('deit_small_patch16_224', pretrained=pretrained, **model_kwargs)
-    return model
-
-@register_model
-def deit_small_patch16_288_shrink06(pretrained=False, base_keep_rate=0.6, **kwargs):
-    model_kwargs = dict(patch_size=16, embed_dim=384, depth=12, num_heads=6,
-                        keep_rate=(1, 1, 1, 0.6) + (1, 1, 0.6) + (1, 1, 0.6) + (1, 1), **kwargs)
-    model = _create_evit('deit_small_patch16_288', pretrained=pretrained, **model_kwargs)
-    return model
-
-@register_model
-def deit_small_patch16_304_shrink05(pretrained=False, base_keep_rate=0.5, **kwargs):
-    model_kwargs = dict(patch_size=16, embed_dim=384, depth=12, num_heads=6,
-                        keep_rate=(1, 1, 1, 0.5) + (1, 1, 0.5) + (1, 1, 0.5) + (1, 1), **kwargs)
-    model = _create_evit('deit_small_patch16_304', pretrained=pretrained, **model_kwargs)
-    return model
-
-
-# -------------------------------------------------------------
-@register_model
-def deit_base_patch16_224(pretrained=False, **kwargs):
-    """ DeiT base model @ 224x224 from paper (https://arxiv.org/abs/2012.12877).
-    ImageNet-1k weights from https://github.com/facebookresearch/deit.
-    """
-    model_kwargs = dict(patch_size=16, embed_dim=768, depth=12, num_heads=12, **kwargs)
-    model = _create_evit('deit_base_patch16_224', pretrained=pretrained, **model_kwargs)
-    return model
-
-@register_model
-def deit_base_patch16_384(pretrained=False, **kwargs):
-    """ DeiT base model @ 384x384 from paper (https://arxiv.org/abs/2012.12877).
-    ImageNet-1k weights from https://github.com/facebookresearch/deit.
-    """
-    model_kwargs = dict(patch_size=16, embed_dim=768, depth=12, num_heads=12, **kwargs)
-    model = _create_evit('deit_base_patch16_384', pretrained=pretrained, **model_kwargs)
-    return model
-
-
 if __name__ == "__main__":
-    model = deit_small_patch16_shrink_base(num_classes=1000, base_keep_rate=0.5).cuda()
-    flops = calc_flops(model, img_size=224)
+
+    model = deit_small_patch16_shrink_base_l2nga_fix01(base_keep_rate=0.7).cuda()
+    img_size = 224
+    x = torch.randn(16, 3, img_size, img_size).cuda()
+    model(x)

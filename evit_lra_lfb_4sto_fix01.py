@@ -31,6 +31,8 @@ import math
 import logging
 from functools import partial
 from collections import OrderedDict
+from os import device_encoding
+from re import A
 
 import torch
 import torch.nn as nn
@@ -45,37 +47,16 @@ from helpers import complement_idx
 
 _logger = logging.getLogger(__name__)
 
-from typing import Any, Callable, List, Optional, Union
-from numbers import Number
-from fvcore.nn import FlopCountAnalysis
-import numpy as np
+def batch_index_select(x, idx):
+    if len(x.size()) == 3:
+        
+        B, N, C = x.size()
+        N_new = idx.size(1)
+        offset = torch.arange(B, dtype=torch.long, device=x.device).view(B, 1) * N
+        idx = idx + offset
+        out = x.reshape(B*N, C)[idx.reshape(-1)].reshape(B, N_new, C)
 
-def rfft_flop_jit(inputs: List[Any], outputs: List[Any]) -> Number:
-    """
-    Count flops for the rfft/rfftn operator.
-    """
-    input_shape = inputs[0].type().sizes()
-    B, H, W, C = input_shape
-    N = H * W
-    flops = N * C * np.ceil(np.log2(N))
-    return flops
-
-def calc_flops(model, img_size=224, show_details=False, ratios=None):
-    with torch.no_grad():
-        x = torch.randn(1, 3, img_size, img_size).cuda()
-        model.default_ratio = ratios
-        fca1 = FlopCountAnalysis(model, x)
-        handlers = {
-            'aten::fft_rfft2': rfft_flop_jit,
-            'aten::fft_irfft2': rfft_flop_jit,
-        }
-        fca1.set_op_handle(**handlers)
-        flops1 = fca1.total()
-        if show_details:
-            print(fca1.by_module())
-        print("#### GFLOPs: {} for ratio {}".format(flops1 / 1e9, ratios))
-    return flops1 / 1e9
-    
+        return out
 
 def _cfg(url='', **kwargs):
     return {
@@ -207,101 +188,145 @@ class PatchEmbed(nn.Module):
 
 
 class Attention(nn.Module):
-    def __init__(self, dim, num_heads=8, qkv_bias=False, attn_drop=0., proj_drop=0., keep_rate=1.):
+    def __init__(self, dim, num_heads=8, qkv_bias=False, attn_drop=0., proj_drop=0., keep_rate=1., base_keep_rate=1., depth=0,save_tokens=0):
         super().__init__()
         self.num_heads = num_heads
         head_dim = dim // num_heads
+        self.depth = depth
         self.scale = head_dim ** -0.5
-
+        self.base_keep_rate=base_keep_rate
         self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
         self.attn_drop = nn.Dropout(attn_drop)
         self.proj = nn.Linear(dim, dim)
         self.proj_drop = nn.Dropout(proj_drop)
         self.keep_rate = keep_rate
+        self.save_tokens=save_tokens
         assert 0 < keep_rate <= 1, "keep_rate must > 0 and <= 1, got {0}".format(keep_rate)
 
-    def forward(self, x, keep_rate=None, tokens=None):
+        self.relative_position_bias_table = nn.Parameter(
+            torch.zeros(1, num_heads, 197 + self.save_tokens, 197 + self.save_tokens))  # 2*Wh-1 * 2*Ww-1, nH
+
+        trunc_normal_(self.relative_position_bias_table, std=.02)
+        if self.depth == 0:
+            self.gamma = nn.Parameter(torch.tensor([0.],requires_grad=True))
+            self.gamma_save = nn.Parameter(torch.tensor([0.],requires_grad=True))
+        else:
+            self.gamma = nn.Parameter(torch.tensor([0.5],requires_grad=True))
+            self.gamma_save = nn.Parameter(torch.tensor([0.5],requires_grad=True))
+
+    def forward(self, x, keep_rate=None, tokens=None, alive_idx=None, last_attn=None):
         if keep_rate is None:
             keep_rate = self.keep_rate
         B, N, C = x.shape
+        ST = self.save_tokens
         qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
         q, k, v = qkv[0], qkv[1], qkv[2]   # make torchscript happy (cannot use tensor as tuple)
 
         attn = (q @ k.transpose(-2, -1)) * self.scale
+
+        #! relative_position
+        relative_position_bias = self.relative_position_bias_table[:,:,:N,:N].expand(B,-1,-1,-1)
+        # relative_position_bias = relative_position_bias[:,:,:N,:N]
+        # relative_position_bias = torch.gather(relative_position_bias, dim=2, index=alive_idx.unsqueeze(1).unsqueeze(3).expand(-1,self.num_heads,-1,N))
+        attn_save = attn + relative_position_bias
+        self.gamma.data.clamp_(0., 1.)
+        self.gamma_save.data.clamp_(0., 1.)
+        last_attn = (1 - self.gamma_save) * attn_save + self.gamma_save * last_attn
+        attn = last_attn
+
+        if self.depth > 3:
+            behind_tokens = math.ceil(self.base_keep_rate * (N - (ST + 1)))
+            attn[:,:,1:ST + 1,ST + 1:behind_tokens+ST + 1] = 0
         attn = attn.softmax(dim=-1)
         attn = self.attn_drop(attn)
-
+        
         x = (attn @ v).transpose(1, 2).reshape(B, N, C)
         x = self.proj(x)
         x = self.proj_drop(x)
 
-        left_tokens = N - 1
+        left_tokens = N - (ST + 1)
         if self.keep_rate < 1 and keep_rate < 1 or tokens is not None:  # double check the keep rate
-            left_tokens = math.ceil(keep_rate * (N - 1))
+            left_tokens = math.ceil(keep_rate * (N - (ST + 1)))
             if tokens is not None:
                 left_tokens = tokens
-            if left_tokens == N - 1:
-                return x, None, None, None, left_tokens
+            if left_tokens == N - (ST + 1):
+                return x, None, None, None, left_tokens, alive_idx, last_attn
             assert left_tokens >= 1
-            cls_attn = attn[:, :, 0, 1:]  # [B, H, N-1]
+            cls_attn = attn[:, :, 0, (ST + 1):]  # [B, H, N-1]
             cls_attn = cls_attn.mean(dim=1)  # [B, N-1]
             _, idx = torch.topk(cls_attn, left_tokens, dim=1, largest=True, sorted=True)  # [B, left_tokens]
             # cls_idx = torch.zeros(B, 1, dtype=idx.dtype, device=idx.device)
             # index = torch.cat([cls_idx, idx + 1], dim=1)
             index = idx.unsqueeze(-1).expand(-1, -1, C)  # [B, left_tokens, C]
 
-            return x, index, idx, cls_attn, left_tokens
+            return x, index, idx, cls_attn, left_tokens, alive_idx, last_attn
 
-        return  x, None, None, None, left_tokens
+        return  x, None, None, None, left_tokens, alive_idx, last_attn
 
 
 class Block(nn.Module):
 
     def __init__(self, dim, num_heads, mlp_ratio=4., qkv_bias=False, drop=0., attn_drop=0.,
                  drop_path=0., act_layer=nn.GELU, norm_layer=nn.LayerNorm, keep_rate=0.,
-                 fuse_token=False):
+                 fuse_token=False, base_keep_rate=1., depth=12, save_tokens=0):
         super().__init__()
+        self.depth = depth
         self.norm1 = norm_layer(dim)
+        self.base_keep_rate=base_keep_rate
+        self.save_tokens=save_tokens
         self.attn = Attention(dim, num_heads=num_heads, qkv_bias=qkv_bias,
-                              attn_drop=attn_drop, proj_drop=drop, keep_rate=keep_rate)
+                              attn_drop=attn_drop, proj_drop=drop, keep_rate=keep_rate,base_keep_rate=self.base_keep_rate,depth=self.depth,save_tokens=self.save_tokens)
         # NOTE: drop path for stochastic depth, we shall see if this is better than dropout here
         self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
         self.norm2 = norm_layer(dim)
         mlp_hidden_dim = int(dim * mlp_ratio)
         self.mlp = Mlp(in_features=dim, hidden_features=mlp_hidden_dim, act_layer=act_layer, drop=drop)
         self.keep_rate = keep_rate
+
         self.mlp_hidden_dim = mlp_hidden_dim
         self.fuse_token = fuse_token
 
-    def forward(self, x, keep_rate=None, tokens=None, get_idx=False):
+    def forward(self, x, keep_rate=None, tokens=None, get_idx=False, alive_idx=None, last_attn=None):
         if keep_rate is None:
             keep_rate = self.keep_rate  # this is for inference, use the default keep rate
         B, N, C = x.shape
-
-        tmp, index, idx, cls_attn, left_tokens = self.attn(self.norm1(x), keep_rate, tokens)
+        tmp, index, idx, cls_attn, left_tokens, alive_idx, last_attn = self.attn(self.norm1(x), keep_rate, tokens, alive_idx, last_attn)
         x = x + self.drop_path(tmp)
 
         if index is not None:
             # B, N, C = x.shape
-            non_cls = x[:, 1:]
+            ST = self.save_tokens
+            non_cls = x[:, ST + 1:]
+            dim4_index = idx.unsqueeze(1).unsqueeze(1).expand(-1, last_attn.shape[1], last_attn.shape[2], -1) # [B, left_tokens] [B, 1, 1, left_tokens]
+            last_attn = torch.cat((last_attn[:, :, :, 0:ST + 1],torch.gather(last_attn[:, :, :, ST + 1:], dim=3, index=dim4_index)),dim=3)
+
+            non_cls_last_attn = last_attn[:, :, ST + 1:]
             x_others = torch.gather(non_cls, dim=1, index=index)  # [B, left_tokens, C]
+            dim3_index = idx.unsqueeze(1).unsqueeze(-1).expand(-1, last_attn.shape[1], -1, last_attn.shape[3]) # [B, left_tokens] [B, 1, left_tokens, 1]
+            last_attn_others = torch.gather(non_cls_last_attn, dim=2, index=dim3_index)
+            alive_idx = torch.cat((alive_idx[:, 0:ST + 1],torch.gather(alive_idx, dim=1, index=idx)),dim=1)
 
             if self.fuse_token:
-                compl = complement_idx(idx, N - 1)  # [B, N-1-left_tokens]
+                compl = complement_idx(idx, N - (ST + 1))  # [B, N-1-left_tokens]
                 non_topk = torch.gather(non_cls, dim=1, index=compl.unsqueeze(-1).expand(-1, -1, C))  # [B, N-1-left_tokens, C]
+                # non_topk = batch_index_select(non_cls, compl)
 
                 non_topk_attn = torch.gather(cls_attn, dim=1, index=compl)  # [B, N-1-left_tokens]
+                non_topk_last_attn = torch.gather(non_cls_last_attn, dim=2, index=compl)
                 extra_token = torch.sum(non_topk * non_topk_attn.unsqueeze(-1), dim=1, keepdim=True)  # [B, 1, C]
-                x = torch.cat([x[:, 0:1], x_others, extra_token], dim=1)
+                extra_last_attn = torch.sum(non_topk * non_topk_last_attn.unsqueeze(-1), dim=2, keepdim=True)  # [B, 1, C]
+                x = torch.cat([x[:, 0:ST + 1], x_others, extra_token], dim=1)
+                last_attn = torch.cat([last_attn[:, :, 0:ST + 1], last_attn_others, extra_last_attn], dim=2)
             else:
-                x = torch.cat([x[:, 0:1], x_others], dim=1)
+                x = torch.cat([x[:, 0:ST + 1], x_others], dim=1)
+                last_attn = torch.cat([last_attn[:, :, 0:ST + 1], last_attn_others], dim=2)
 
         x = x + self.drop_path(self.mlp(self.norm2(x)))
-        n_tokens = x.shape[1] - 1
+        # print(alive_idx)
+        n_tokens = x.shape[1] - (self.save_tokens + 1)
         if get_idx and index is not None:
-            return x, n_tokens, idx
-        return x, n_tokens, None
-
+            return x, n_tokens, idx, alive_idx, last_attn 
+        return x, n_tokens, None, alive_idx, last_attn 
 
 class EViT(nn.Module):
     """ EViT """
@@ -309,7 +334,7 @@ class EViT(nn.Module):
     def __init__(self, img_size=224, patch_size=16, in_chans=3, num_classes=1000, embed_dim=768, depth=12,
                  num_heads=12, mlp_ratio=4., qkv_bias=True, representation_size=None, distilled=False,
                  drop_rate=0., attn_drop_rate=0., drop_path_rate=0., embed_layer=PatchEmbed, norm_layer=None,
-                 act_layer=None, weight_init='', keep_rate=(1, ), fuse_token=False):
+                 act_layer=None, weight_init='', keep_rate=(1, ), fuse_token=False, base_keep_rate=1., save_tokens=0):
         """
         Args:
             img_size (int, tuple): input image size
@@ -331,19 +356,22 @@ class EViT(nn.Module):
             weight_init: (str): weight init scheme
         """
         super().__init__()
+        fuse_token=False
         self.img_size = img_size
         if len(keep_rate) == 1:
             keep_rate = keep_rate * depth
         self.keep_rate = keep_rate
         self.depth = depth
         self.first_shrink_idx = depth
+        self.base_keep_rate=base_keep_rate
+        self.save_tokens = save_tokens
         for i, s in enumerate(keep_rate):
             if s < 1:
                 self.first_shrink_idx = i
                 break
         self.num_classes = num_classes
         self.num_features = self.embed_dim = embed_dim  # num_features for consistency with other models
-        self.num_tokens = 2 if distilled else 1
+        self.num_tokens = self.save_tokens + 2 if distilled else self.save_tokens + 1
         norm_layer = norm_layer or partial(nn.LayerNorm, eps=1e-6)
         act_layer = act_layer or nn.GELU
 
@@ -351,7 +379,7 @@ class EViT(nn.Module):
             img_size=img_size, patch_size=patch_size, in_chans=in_chans, embed_dim=embed_dim)
         num_patches = self.patch_embed.num_patches
 
-        self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
+        self.cls_token = nn.Parameter(torch.zeros(1, self.save_tokens + 1, embed_dim))
         self.dist_token = nn.Parameter(torch.zeros(1, 1, embed_dim)) if distilled else None
         self.pos_embed = nn.Parameter(torch.zeros(1, num_patches + self.num_tokens, embed_dim))
         self.pos_drop = nn.Dropout(p=drop_rate)
@@ -361,11 +389,16 @@ class EViT(nn.Module):
             Block(
                 dim=embed_dim, num_heads=num_heads, mlp_ratio=mlp_ratio, qkv_bias=qkv_bias, drop=drop_rate,
                 attn_drop=attn_drop_rate, drop_path=dpr[i], norm_layer=norm_layer, act_layer=act_layer,
-                keep_rate=keep_rate[i], fuse_token=fuse_token)
+                keep_rate=keep_rate[i], fuse_token=fuse_token, base_keep_rate=self.base_keep_rate, depth=i, save_tokens=self.save_tokens)
             for i in range(depth)])
         self.norm = norm_layer(embed_dim)
 
         # Representation layer
+        self.neck = nn.Sequential(
+            nn.Linear(embed_dim, embed_dim),
+            nn.LayerNorm(embed_dim),
+            nn.GELU()
+        )
         if representation_size and not distilled:
             self.num_features = representation_size
             self.pre_logits = nn.Sequential(OrderedDict([
@@ -456,16 +489,20 @@ class EViT(nn.Module):
 
         left_tokens = []
         idxs = []
+        alive_idx = torch.arange(x.shape[1], device=x.device).expand(x.shape[0], -1)
+        last_attn = None
         for i, blk in enumerate(self.blocks):
-            x, left_token, idx = blk(x, keep_rate[i], tokens[i], get_idx)
+            x, left_token, idx, alive_idx, last_attn = blk(x, keep_rate[i], tokens[i], get_idx, alive_idx, last_attn)
             left_tokens.append(left_token)
             if idx is not None:
                 idxs.append(idx)
         x = self.norm(x)
+        x = self.neck(x)
         if self.dist_token is None:
+
             return self.pre_logits(x[:, 0]), left_tokens, idxs
         else:
-            return x[:, 0], x[:, 1], idxs
+            return x[:, 0], x[:, self.save_tokens+1], idxs
 
     def forward(self, x, keep_rate=None, tokens=None, get_idx=False):
         x, _, idxs = self.forward_features(x, keep_rate, tokens, get_idx)
@@ -481,7 +518,6 @@ class EViT(nn.Module):
         if get_idx:
             return x, idxs
         return x
-
 
 def _init_vit_weights(module: nn.Module, name: str = '', head_bias: float = 0., jax_impl: bool = False):
     """ ViT weight initialization
@@ -516,7 +552,6 @@ def _init_vit_weights(module: nn.Module, name: str = '', head_bias: float = 0., 
     elif isinstance(module, (nn.LayerNorm, nn.GroupNorm, nn.BatchNorm2d)):
         nn.init.zeros_(module.bias)
         nn.init.ones_(module.weight)
-
 
 @torch.no_grad()
 def _load_weights(model: EViT, checkpoint_path: str, prefix: str = ''):
@@ -597,7 +632,6 @@ def _load_weights(model: EViT, checkpoint_path: str, prefix: str = ''):
         block.norm2.weight.copy_(_n2p(w[f'{block_prefix}LayerNorm_2/scale']))
         block.norm2.bias.copy_(_n2p(w[f'{block_prefix}LayerNorm_2/bias']))
 
-
 def resize_pos_embed(posemb, posemb_new, num_tokens=1, gs_new=()):
     # Rescale the grid of position embeddings when loading from state_dict. Adapted from
     # https://github.com/google-research/vision_transformer/blob/00883dd691c63a6830751563748663526e811cee/vit_jax/checkpoint.py#L224
@@ -619,7 +653,6 @@ def resize_pos_embed(posemb, posemb_new, num_tokens=1, gs_new=()):
     posemb = torch.cat([posemb_tok, posemb_grid], dim=1)
     return posemb
 
-
 def checkpoint_filter_fn(state_dict, model):
     """ convert patch embedding weight from manual patchify + linear proj to conv"""
     out_dict = {}
@@ -637,7 +670,6 @@ def checkpoint_filter_fn(state_dict, model):
                 v, model.pos_embed, getattr(model, 'num_tokens', 1), model.patch_embed.grid_size)
         out_dict[k] = v
     return out_dict
-
 
 def _create_evit(variant, pretrained=False, default_cfg=None, **kwargs):
     default_cfg = default_cfg or default_cfgs[variant]
@@ -664,116 +696,21 @@ def _create_evit(variant, pretrained=False, default_cfg=None, **kwargs):
         **kwargs)
     return model
 
-
-@register_model
-def deit_tiny_patch16_224(pretrained=False, **kwargs):
-    """ DeiT-tiny model @ 224x224 from paper (https://arxiv.org/abs/2012.12877).
-    ImageNet-1k weights from https://github.com/facebookresearch/deit.
-    """
-    model_kwargs = dict(patch_size=16, embed_dim=192, depth=12, num_heads=3, **kwargs)
-    model = _create_evit('deit_tiny_patch16_224', pretrained=pretrained, **model_kwargs)
-    return model
-
-
-@register_model
-def deit_small_patch16_224(pretrained=False, **kwargs):
-    """ DeiT-small model @ 224x224 from paper (https://arxiv.org/abs/2012.12877).
-    ImageNet-1k weights from https://github.com/facebookresearch/deit.
-    """
-    model_kwargs = dict(patch_size=16, embed_dim=384, depth=12, num_heads=6, **kwargs)
-    model = _create_evit('deit_small_patch16_224', pretrained=pretrained, **model_kwargs)
-    return model
-
-
 # -------------------------------------------------------------
 # EViT prototype models
 @register_model
-def deit_small_patch16_shrink_base(pretrained=False, base_keep_rate=0.7, drop_loc=(3, 6, 9), **kwargs):
+def deit_small_patch16_shrink_base_lra_lfb_4sto_fix01(pretrained=False, base_keep_rate=0.7, drop_loc=(3, 6, 9), **kwargs):
     keep_rate = [1] * 12
     for loc in drop_loc:
         keep_rate[loc] = base_keep_rate
-    model_kwargs = dict(patch_size=16, embed_dim=384, depth=12, num_heads=6, keep_rate=keep_rate)
+    model_kwargs = dict(patch_size=16, embed_dim=384, depth=12, num_heads=6, keep_rate=keep_rate, base_keep_rate=base_keep_rate, save_tokens=4)
     model_kwargs.update(kwargs)
     model = _create_evit('deit_small_patch16_224', pretrained=pretrained, **model_kwargs)
     return model
-
-
-@register_model
-def deit_base_patch16_shrink_base(pretrained=False, base_keep_rate=0.7, drop_loc=(3, 6, 9), **kwargs):
-    keep_rate = [1] * 12
-    for loc in drop_loc:
-        keep_rate[loc] = base_keep_rate
-    model_kwargs = dict(patch_size=16, embed_dim=768, depth=12, num_heads=12, keep_rate=keep_rate)
-    model_kwargs.update(kwargs)
-    model = _create_evit('deit_base_patch16_224', pretrained=pretrained, **model_kwargs)
-    return model
-
-
-# -------------------------------------------------------------
-# Some example EViT models
-@register_model
-def deit_small_patch16_224_shrink_base(pretrained=False, base_keep_rate=0.7, **kwargs):
-    model_kwargs = dict(patch_size=16, embed_dim=384, depth=12, num_heads=6,
-                        keep_rate=(1, 1, 1, base_keep_rate) + (1, 1, base_keep_rate) + (1, 1, base_keep_rate) + (1, 1), **kwargs)
-    model = _create_evit('deit_small_patch16_224', pretrained=pretrained, **model_kwargs)
-    return model
-
-@register_model
-def deit_small_patch16_224_shrink(pretrained=False, base_keep_rate=0.5, **kwargs):
-    model_kwargs = dict(patch_size=16, embed_dim=384, depth=12, num_heads=6,
-                        keep_rate=(1, 1, 1, 0.7) + (1, 1, 0.7) + (1, 1, 0.7) + (1, 1), **kwargs)
-    model = _create_evit('deit_small_patch16_224', pretrained=pretrained, **model_kwargs)
-    return model
-
-@register_model
-def deit_small_patch16_272_shrink(pretrained=False, base_keep_rate=0.5, **kwargs):
-    model_kwargs = dict(patch_size=16, embed_dim=384, depth=12, num_heads=6,
-                        keep_rate=(1, 1, 1, 0.7) + (1, 1, 0.7) + (1, 1, 0.7) + (1, 1), **kwargs)
-    model = _create_evit('deit_small_patch16_272', pretrained=pretrained, **model_kwargs)
-    return model
-
-@register_model
-def deit_small_patch16_224_shrink05(pretrained=False, base_keep_rate=0.5, **kwargs):
-    model_kwargs = dict(patch_size=16, embed_dim=384, depth=12, num_heads=6,
-                        keep_rate=(1, 1, 1, 0.5) + (1, 1, 0.5) + (1, 1, 0.5) + (1, 1), **kwargs)
-    model = _create_evit('deit_small_patch16_224', pretrained=pretrained, **model_kwargs)
-    return model
-
-@register_model
-def deit_small_patch16_288_shrink06(pretrained=False, base_keep_rate=0.6, **kwargs):
-    model_kwargs = dict(patch_size=16, embed_dim=384, depth=12, num_heads=6,
-                        keep_rate=(1, 1, 1, 0.6) + (1, 1, 0.6) + (1, 1, 0.6) + (1, 1), **kwargs)
-    model = _create_evit('deit_small_patch16_288', pretrained=pretrained, **model_kwargs)
-    return model
-
-@register_model
-def deit_small_patch16_304_shrink05(pretrained=False, base_keep_rate=0.5, **kwargs):
-    model_kwargs = dict(patch_size=16, embed_dim=384, depth=12, num_heads=6,
-                        keep_rate=(1, 1, 1, 0.5) + (1, 1, 0.5) + (1, 1, 0.5) + (1, 1), **kwargs)
-    model = _create_evit('deit_small_patch16_304', pretrained=pretrained, **model_kwargs)
-    return model
-
-
-# -------------------------------------------------------------
-@register_model
-def deit_base_patch16_224(pretrained=False, **kwargs):
-    """ DeiT base model @ 224x224 from paper (https://arxiv.org/abs/2012.12877).
-    ImageNet-1k weights from https://github.com/facebookresearch/deit.
-    """
-    model_kwargs = dict(patch_size=16, embed_dim=768, depth=12, num_heads=12, **kwargs)
-    model = _create_evit('deit_base_patch16_224', pretrained=pretrained, **model_kwargs)
-    return model
-
-@register_model
-def deit_base_patch16_384(pretrained=False, **kwargs):
-    """ DeiT base model @ 384x384 from paper (https://arxiv.org/abs/2012.12877).
-    ImageNet-1k weights from https://github.com/facebookresearch/deit.
-    """
-    model_kwargs = dict(patch_size=16, embed_dim=768, depth=12, num_heads=12, **kwargs)
-    model = _create_evit('deit_base_patch16_384', pretrained=pretrained, **model_kwargs)
-    return model
-
 
 if __name__ == "__main__":
-    model = deit_small_patch16_shrink_base(num_classes=1000, base_keep_rate=0.5).cuda()
-    flops = calc_flops(model, img_size=224)
+
+    model = deit_small_patch16_shrink_base_lra_lfb_4sto_fix01(base_keep_rate=0.7)
+    img_size = 224
+    x = torch.randn(16, 3, img_size, img_size)
+    model(x)

@@ -29,7 +29,6 @@ from samplers import RASampler
 import models
 import utils
 from helpers import speed_test, get_macs
-import evit.evit_select as evit_select
 
 import evit_l2
 import evit_l2n
@@ -41,6 +40,23 @@ import evit_l2n9
 import evit_l2n3p
 import evit_l2ng
 import evit_l2ng_bmm   
+import evit_l2g3_bmm  
+import evit_l2nga_fix01
+import evit_l2ng_add_fix01
+import evit_l2ng_add_fix3
+import evit_l2nga_f3_lfb_4sto
+import evit_l2nga_lfb_4sto
+import evit_l2nga_lfb_8sto
+import evit_l2nga_lfb_4sto_fix01
+import evit_mla_lfb_4sto
+import evit_mla_lfb_4sto_fix01
+import evit_lral_lfb_4sto_fix01
+import evit_lrald_lfb_4sto_fix01
+import evit_l2nga_lfb_4sto_fix01_nd
+import evit_l2nga_lfb_4sto_fix01_np
+import evit_lra_lfb_4sto_fix01
+import evit_r4_lfb_4sto
+
 
 import evit_l3
 import evit_l3n
@@ -48,9 +64,36 @@ import evit_l3g
 import evit_l3w
 import evit_l3wg
 
+
+import evit_8cls
+import evit_8save
+import evit_8save_expand8
+import evit_8expand_half
+
+import evit_add
+import evit_posbias
+import evit_add_lfb
+import evit_lfb_1st
+import evit_lfb_1sto
+import evit_lfb_4st
+import evit_lfb_4sto
+import evit_lfb_4sto_nk
+import evit_r4_tt0_lfb_4sto
+
+import evit_lfbo_4sto
+
+import evit_se_pb
+import evit_se
+import evit_se_lfb
+import evit_se_lfb_4sto
+import evit_se_lfb_4stoa
+import evit_se_8soi
+
 from tensorboardX import SummaryWriter
 import warnings
 warnings.filterwarnings('ignore', 'Argument interpolation should be of type InterpolationMode instead of int')
+
+# torch.autograd.set_detect_anomaly(True)
 
 def get_args_parser():
     parser = argparse.ArgumentParser('DeiT training and evaluation script', add_help=False)
@@ -369,7 +412,7 @@ def main(args):
 
     model_without_ddp = model
     if args.distributed:
-        model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu])
+        model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu], broadcast_buffers=False, find_unused_parameters=True)
         model_without_ddp = model.module
     n_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print('number of params:', n_parameters)

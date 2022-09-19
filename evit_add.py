@@ -31,6 +31,8 @@ import math
 import logging
 from functools import partial
 from collections import OrderedDict
+from os import device_encoding
+from re import A
 
 import torch
 import torch.nn as nn
@@ -199,10 +201,12 @@ class Attention(nn.Module):
         self.keep_rate = keep_rate
         assert 0 < keep_rate <= 1, "keep_rate must > 0 and <= 1, got {0}".format(keep_rate)
 
-        # self.relative_position_bias_table = nn.Parameter(
-        #     torch.zeros((2 * window_size[0] - 1) * (2 * window_size[1] - 1), num_heads))  # 2*Wh-1 * 2*Ww-1, nH
+        self.relative_position_bias_table = nn.Parameter(
+            torch.zeros(1, num_heads, 197, 197))  # 2*Wh-1 * 2*Ww-1, nH
 
-    def forward(self, x, keep_rate=None, tokens=None):
+        trunc_normal_(self.relative_position_bias_table, std=.02)
+
+    def forward(self, x, keep_rate=None, tokens=None, alive_idx=None):
         if keep_rate is None:
             keep_rate = self.keep_rate
         B, N, C = x.shape
@@ -210,6 +214,13 @@ class Attention(nn.Module):
         q, k, v = qkv[0], qkv[1], qkv[2]   # make torchscript happy (cannot use tensor as tuple)
 
         attn = (q @ k.transpose(-2, -1)) * self.scale
+
+        #! relative_position
+        relative_position_bias = self.relative_position_bias_table.expand(B,-1,-1,-1)
+        relative_position_bias = torch.gather(relative_position_bias, dim=3, index=alive_idx.unsqueeze(1).unsqueeze(2).expand(-1,self.num_heads,197,-1))
+        relative_position_bias = torch.gather(relative_position_bias, dim=2, index=alive_idx.unsqueeze(1).unsqueeze(3).expand(-1,self.num_heads,-1,N))
+        attn = attn + relative_position_bias
+
         attn = attn.softmax(dim=-1)
         attn = self.attn_drop(attn)
 
@@ -223,7 +234,7 @@ class Attention(nn.Module):
             if tokens is not None:
                 left_tokens = tokens
             if left_tokens == N - 1:
-                return x, None, None, None, left_tokens
+                return x, None, None, None, left_tokens, alive_idx
             assert left_tokens >= 1
             cls_attn = attn[:, :, 0, 1:]  # [B, H, N-1]
             cls_attn = cls_attn.mean(dim=1)  # [B, N-1]
@@ -232,9 +243,9 @@ class Attention(nn.Module):
             # index = torch.cat([cls_idx, idx + 1], dim=1)
             index = idx.unsqueeze(-1).expand(-1, -1, C)  # [B, left_tokens, C]
 
-            return x, index, idx, cls_attn, left_tokens
+            return x, index, idx, cls_attn, left_tokens, alive_idx
 
-        return  x, None, None, None, left_tokens
+        return  x, None, None, None, left_tokens, alive_idx
 
 
 class Block(nn.Module):
@@ -255,24 +266,25 @@ class Block(nn.Module):
         self.mlp_hidden_dim = mlp_hidden_dim
         self.fuse_token = fuse_token
 
-    def forward(self, x, keep_rate=None, tokens=None, get_idx=False):
+    def forward(self, x, keep_rate=None, tokens=None, get_idx=False, alive_idx=None):
         if keep_rate is None:
             keep_rate = self.keep_rate  # this is for inference, use the default keep rate
         B, N, C = x.shape
 
-        tmp, index, idx, cls_attn, left_tokens = self.attn(self.norm1(x), keep_rate, tokens)
+        tmp, index, idx, cls_attn, left_tokens, alive_idx = self.attn(self.norm1(x), keep_rate, tokens, alive_idx)
         x = x + self.drop_path(tmp)
 
         if index is not None:
             # B, N, C = x.shape
             non_cls = x[:, 1:]
-            # x_others = torch.gather(non_cls, dim=1, index=index)  # [B, left_tokens, C]
+            x_others = torch.gather(non_cls, dim=1, index=index)  # [B, left_tokens, C]
 
-            x_others  = batch_index_select(non_cls, idx)
+            alive_idx = torch.cat((alive_idx[:, 0:1],torch.gather(alive_idx, dim=1, index=idx)),dim=1)
+
             if self.fuse_token:
                 compl = complement_idx(idx, N - 1)  # [B, N-1-left_tokens]
-                # non_topk = torch.gather(non_cls, dim=1, index=compl.unsqueeze(-1).expand(-1, -1, C))  # [B, N-1-left_tokens, C]
-                non_topk = batch_index_select(non_cls, compl)
+                non_topk = torch.gather(non_cls, dim=1, index=compl.unsqueeze(-1).expand(-1, -1, C))  # [B, N-1-left_tokens, C]
+                # non_topk = batch_index_select(non_cls, compl)
 
                 non_topk_attn = torch.gather(cls_attn, dim=1, index=compl)  # [B, N-1-left_tokens]
                 extra_token = torch.sum(non_topk * non_topk_attn.unsqueeze(-1), dim=1, keepdim=True)  # [B, 1, C]
@@ -281,10 +293,11 @@ class Block(nn.Module):
                 x = torch.cat([x[:, 0:1], x_others], dim=1)
 
         x = x + self.drop_path(self.mlp(self.norm2(x)))
+        # print(alive_idx)
         n_tokens = x.shape[1] - 1
         if get_idx and index is not None:
-            return x, n_tokens, idx
-        return x, n_tokens, None
+            return x, n_tokens, idx, alive_idx
+        return x, n_tokens, None, alive_idx
 
 
 class EViT(nn.Module):
@@ -440,9 +453,9 @@ class EViT(nn.Module):
 
         left_tokens = []
         idxs = []
-        # alive_tokens_idx = torch.range(0,len(pos_embed[1]),1)torch.arange(0, 1, 1/patches_h)
+        alive_idx = torch.arange(x.shape[1], device=x.device).expand(x.shape[0], -1)
         for i, blk in enumerate(self.blocks):
-            x, left_token, idx = blk(x, keep_rate[i], tokens[i], get_idx)
+            x, left_token, idx, alive_idx = blk(x, keep_rate[i], tokens[i], get_idx, alive_idx)
             left_tokens.append(left_token)
             if idx is not None:
                 idxs.append(idx)
@@ -664,7 +677,7 @@ def deit_small_patch16_shrink_base_add(pretrained=False, base_keep_rate=0.7, dro
 
 if __name__ == "__main__":
 
-    model = deit_small_patch16_shrink_base_add(base_keep_rate=0.7).cuda()
+    model = deit_small_patch16_shrink_base_add(base_keep_rate=0.7)
     img_size = 224
-    x = torch.randn(16, 3, img_size, img_size).cuda()
+    x = torch.randn(16, 3, img_size, img_size)
     model(x)

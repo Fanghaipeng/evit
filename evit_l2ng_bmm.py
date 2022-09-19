@@ -198,7 +198,7 @@ class Attention(nn.Module):
         self.proj_drop = nn.Dropout(proj_drop)
         self.keep_rate = keep_rate
         assert 0 < keep_rate <= 1, "keep_rate must > 0 and <= 1, got {0}".format(keep_rate)
-        self.gamma = nn.Parameter(torch.tensor([0.3],requires_grad=True))
+        self.gamma = nn.Parameter(torch.tensor([0.5],requires_grad=True))
 
         self.min = torch.tensor([0.]).cuda()
         self.max = torch.tensor([1.]).cuda()

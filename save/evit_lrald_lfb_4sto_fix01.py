@@ -233,7 +233,7 @@ class Attention(nn.Module):
         self.gamma_save.data.clamp_(0., 1.)
         if last_attn is not None:
             attn = (1 - self.gamma) * attn_save + self.gamma * last_attn
-            last_attn = (1 - self.gamma_save) * attn_save + self.gamma_save * last_attn
+            last_attn = (1 - self.gamma_save) * attn_save.detach() + self.gamma_save * last_attn.detach()
         else:
             attn = attn_save
             last_attn = attn_save
@@ -702,7 +702,7 @@ def _create_evit(variant, pretrained=False, default_cfg=None, **kwargs):
 # -------------------------------------------------------------
 # EViT prototype models
 @register_model
-def deit_small_patch16_shrink_base_lral_lfb_4sto_fix01(pretrained=False, base_keep_rate=0.7, drop_loc=(3, 6, 9), **kwargs):
+def deit_small_patch16_shrink_base_lrald_lfb_4sto_fix01(pretrained=False, base_keep_rate=0.7, drop_loc=(3, 6, 9), **kwargs):
     keep_rate = [1] * 12
     for loc in drop_loc:
         keep_rate[loc] = base_keep_rate
@@ -713,7 +713,7 @@ def deit_small_patch16_shrink_base_lral_lfb_4sto_fix01(pretrained=False, base_ke
 
 if __name__ == "__main__":
 
-    model = deit_small_patch16_shrink_base_lral_lfb_4sto_fix01(base_keep_rate=0.7)
+    model = deit_small_patch16_shrink_base_lrald_lfb_4sto_fix01(base_keep_rate=0.7)
     img_size = 224
     x = torch.randn(16, 3, img_size, img_size)
     model(x)

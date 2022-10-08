@@ -68,7 +68,9 @@ def train_one_epoch(model: torch.nn.Module, criterion: DistillationLoss,
         is_second_order = hasattr(optimizer, 'is_second_order') and optimizer.is_second_order
         loss_scaler(loss, optimizer, clip_grad=max_norm,
                     parameters=model.parameters(), create_graph=is_second_order)
-
+        for name, param in model.named_parameters():
+            if param.grad is None:
+                print(name) 
         torch.cuda.synchronize()
         if model_ema is not None:
             model_ema.update(model)
@@ -104,7 +106,7 @@ def evaluate(data_loader, model, device, keep_rate=None):
 
         # compute output
         with torch.cuda.amp.autocast():
-            output = model(images, keep_rate)
+            output,output_kd = model(images, keep_rate)
             loss = criterion(output, target)
 
         acc1, acc5 = accuracy(output, target, topk=(1, 5))

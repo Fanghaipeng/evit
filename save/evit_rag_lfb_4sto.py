@@ -207,12 +207,8 @@ class Attention(nn.Module):
             torch.zeros(1, num_heads, 197 + self.save_tokens, 197 + self.save_tokens))  # 2*Wh-1 * 2*Ww-1, nH
 
         trunc_normal_(self.relative_position_bias_table, std=.02)
-        if self.depth == 0:
-            self.gamma = nn.Parameter(torch.tensor([0.],requires_grad=True))
-            self.gamma_save = nn.Parameter(torch.tensor([0.],requires_grad=True))
-        else:
-            self.gamma = nn.Parameter(torch.tensor([0.5],requires_grad=True))
-            self.gamma_save = nn.Parameter(torch.tensor([0.5],requires_grad=True))
+        if self.depth > 0:
+            self.gamma = nn.Parameter(torch.tensor([0.1],requires_grad=True))
 
     def forward(self, x, keep_rate=None, tokens=None, alive_idx=None, last_attn=None):
         if keep_rate is None:
@@ -229,11 +225,9 @@ class Attention(nn.Module):
         # relative_position_bias = relative_position_bias[:,:,:N,:N]
         # relative_position_bias = torch.gather(relative_position_bias, dim=2, index=alive_idx.unsqueeze(1).unsqueeze(3).expand(-1,self.num_heads,-1,N))
         attn_save = attn + relative_position_bias
-        self.gamma.data.clamp_(0., 1.)
-        self.gamma_save.data.clamp_(0., 1.)
         if last_attn is not None:
-            attn = (1 - self.gamma) * attn_save + self.gamma * last_attn
-            last_attn = (1 - self.gamma_save) * attn_save + self.gamma_save * last_attn
+            attn = attn_save + self.gamma * last_attn
+            last_attn = 0.2 * attn_save + 0.8 * last_attn
         else:
             attn = attn_save
             last_attn = attn_save
@@ -304,19 +298,20 @@ class Block(nn.Module):
             dim4_index = idx.unsqueeze(1).unsqueeze(1).expand(-1, last_attn.shape[1], last_attn.shape[2], -1) # [B, left_tokens] [B, 1, 1, left_tokens]
             last_attn = torch.cat((last_attn[:, :, :, 0:ST + 1],torch.gather(last_attn[:, :, :, ST + 1:], dim=3, index=dim4_index)),dim=3)
 
-            non_cls_last_attn = last_attn[:, :, ST + 1:]
+            non_cls_last_attn = last_attn[:, :, ST + 1:]# [B, H, N-ST-1,C]
             x_others = torch.gather(non_cls, dim=1, index=index)  # [B, left_tokens, C]
             dim3_index = idx.unsqueeze(1).unsqueeze(-1).expand(-1, last_attn.shape[1], -1, last_attn.shape[3]) # [B, left_tokens] [B, 1, left_tokens, 1]
             last_attn_others = torch.gather(non_cls_last_attn, dim=2, index=dim3_index)
-            alive_idx = torch.cat((alive_idx[:, 0:ST + 1],torch.gather(alive_idx, dim=1, index=idx)),dim=1)
+            alive_idx = torch.cat((alive_idx[:, 0:ST + 1],torch.gather(alive_idx[:, ST + 1:], dim=1, index=idx)),dim=1)
 
             if self.fuse_token:
-                compl = complement_idx(idx, N - (ST + 1))  # [B, N-1-left_tokens]
+                compl = complement_idx(idx, N - (ST + 1))  # [B, N-ST-1-left_tokens]
                 non_topk = torch.gather(non_cls, dim=1, index=compl.unsqueeze(-1).expand(-1, -1, C))  # [B, N-1-left_tokens, C]
                 # non_topk = batch_index_select(non_cls, compl)
 
-                non_topk_attn = torch.gather(cls_attn, dim=1, index=compl)  # [B, N-1-left_tokens]
-                non_topk_last_attn = torch.gather(non_cls_last_attn, dim=2, index=compl)
+                non_topk_attn = torch.gather(cls_attn, dim=1, index=compl)  # [B, N-ST-1-left_tokens]
+                # non_topk_last_attn = torch.gather(non_cls_last_attn, dim=2, index=compl)
+                non_topk_last_attn = torch.gather(non_cls_last_attn, dim=2, index=compl.unsqueeze(1).unsqueeze(-1).expand(-1, N-ST-1, -1, C))
                 extra_token = torch.sum(non_topk * non_topk_attn.unsqueeze(-1), dim=1, keepdim=True)  # [B, 1, C]
                 extra_last_attn = torch.sum(non_topk * non_topk_last_attn.unsqueeze(-1), dim=2, keepdim=True)  # [B, 1, C]
                 x = torch.cat([x[:, 0:ST + 1], x_others, extra_token], dim=1)
@@ -702,7 +697,7 @@ def _create_evit(variant, pretrained=False, default_cfg=None, **kwargs):
 # -------------------------------------------------------------
 # EViT prototype models
 @register_model
-def deit_small_patch16_shrink_base_lral_lfb_4sto_fix01(pretrained=False, base_keep_rate=0.7, drop_loc=(3, 6, 9), **kwargs):
+def deit_small_patch16_shrink_base_rag_lfb_4sto(pretrained=False, base_keep_rate=0.7, drop_loc=(3, 6, 9), **kwargs):
     keep_rate = [1] * 12
     for loc in drop_loc:
         keep_rate[loc] = base_keep_rate
@@ -713,7 +708,7 @@ def deit_small_patch16_shrink_base_lral_lfb_4sto_fix01(pretrained=False, base_ke
 
 if __name__ == "__main__":
 
-    model = deit_small_patch16_shrink_base_lral_lfb_4sto_fix01(base_keep_rate=0.7)
+    model = deit_small_patch16_shrink_base_rag_lfb_4sto(base_keep_rate=0.7)
     img_size = 224
     x = torch.randn(16, 3, img_size, img_size)
     model(x)

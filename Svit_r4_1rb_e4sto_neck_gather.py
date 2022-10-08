@@ -57,6 +57,15 @@ def batch_index_select(x, idx):
         out = x.reshape(B*N, C)[idx.reshape(-1)].reshape(B, N_new, C)
 
         return out
+    elif len(x.size()) == 2:
+        B, N = x.size()
+        N_new = idx.size(1)
+        offset = torch.arange(B, dtype=torch.long, device=x.device).view(B, 1) * N
+        idx = idx + offset
+        out = x.reshape(B*N)[idx.reshape(-1)].reshape(B, N_new)
+        return out
+    else:
+        raise NotImplementedError
 
 def _cfg(url='', **kwargs):
     return {
@@ -67,7 +76,6 @@ def _cfg(url='', **kwargs):
         'first_conv': 'patch_embed.proj', 'classifier': 'head',
         **kwargs
     }
-
 
 default_cfgs = {
     'deit_small_patch16_304': _cfg(
@@ -109,7 +117,6 @@ default_cfgs = {
         classifier=('head', 'head_dist')),
 }
 
-
 def drop_path(x, drop_prob: float = 0., training: bool = False):
     """Drop paths (Stochastic Depth) per sample (when applied in main path of residual blocks).
 
@@ -129,6 +136,103 @@ def drop_path(x, drop_prob: float = 0., training: bool = False):
     output = x.div(keep_prob) * random_tensor
     return output
 
+def resize_pos_embed(posemb, posemb_new, num_tokens=1, gs_new=()):
+    # Rescale the grid of position embeddings when loading from state_dict. Adapted from
+    # https://github.com/google-research/vision_transformer/blob/00883dd691c63a6830751563748663526e811cee/vit_jax/checkpoint.py#L224
+    _logger.info('Resized position embedding: %s to %s', posemb.shape, posemb_new.shape)
+    ntok_new = posemb_new.shape[1]
+    if num_tokens:
+        posemb_tok, posemb_grid = posemb[:, :num_tokens], posemb[0, num_tokens:]
+        ntok_new -= num_tokens
+    else:
+        posemb_tok, posemb_grid = posemb[:, :0], posemb[0]
+    gs_old = int(math.sqrt(len(posemb_grid)))
+    if not len(gs_new):  # backwards compatibility
+        gs_new = [int(math.sqrt(ntok_new))] * 2
+    assert len(gs_new) >= 2
+    _logger.info('Position embedding grid-size from %s to %s', [gs_old, gs_old], gs_new)
+    posemb_grid = posemb_grid.reshape(1, gs_old, gs_old, -1).permute(0, 3, 1, 2)
+    posemb_grid = F.interpolate(posemb_grid, size=gs_new, mode='bicubic', align_corners=False)
+    posemb_grid = posemb_grid.permute(0, 2, 3, 1).reshape(1, gs_new[0] * gs_new[1], -1)
+    posemb = torch.cat([posemb_tok, posemb_grid], dim=1)
+    return posemb
+
+def checkpoint_filter_fn(state_dict, model):
+    """ convert patch embedding weight from manual patchify + linear proj to conv"""
+    out_dict = {}
+    if 'model' in state_dict:
+        # For deit models
+        state_dict = state_dict['model']
+    for k, v in state_dict.items():
+        if 'patch_embed.proj.weight' in k and len(v.shape) < 4:
+            # For old models that I trained prior to conv based patchification
+            O, I, H, W = model.patch_embed.proj.weight.shape
+            v = v.reshape(O, -1, H, W)
+        elif k == 'pos_embed' and v.shape != model.pos_embed.shape:
+            # To resize pos embedding when using model at different size from pretrained weights
+            v = resize_pos_embed(
+                v, model.pos_embed, getattr(model, 'num_tokens', 1), model.patch_embed.grid_size)
+        out_dict[k] = v
+    return out_dict
+
+def _create_evit(variant, pretrained=False, default_cfg=None, **kwargs):
+    default_cfg = default_cfg or default_cfgs[variant]
+    default_cfg.update(kwargs)
+    if kwargs.get('features_only', None):
+        raise RuntimeError('features_only not implemented for Vision Transformer models.')
+
+    # NOTE this extra code to support handling of repr size for in21k pretrained models
+    default_num_classes = default_cfg['num_classes']
+    num_classes = kwargs.get('num_classes', default_num_classes)
+    repr_size = kwargs.pop('representation_size', None)
+    if repr_size is not None and num_classes != default_num_classes:
+        # Remove representation layer if fine-tuning. This may not always be the desired action,
+        # but I feel better than doing nothing by default for fine-tuning. Perhaps a better interface?
+        _logger.warning("Removing representation layer for fine-tuning.")
+        repr_size = None
+
+    model = build_model_with_cfg(
+        EViT, variant, pretrained,
+        default_cfg=default_cfg,
+        representation_size=repr_size,
+        pretrained_filter_fn=checkpoint_filter_fn,
+        pretrained_custom_load='npz' in default_cfg['url'],
+        **kwargs)
+    return model
+
+def _init_vit_weights(module: nn.Module, name: str = '', head_bias: float = 0., jax_impl: bool = False):
+    """ ViT weight initialization
+    * When called without n, head_bias, jax_impl args it will behave exactly the same
+      as my original init for compatibility with prev hparam / downstream use cases (ie DeiT).
+    * When called w/ valid n (module name) and jax_impl=True, will (hopefully) match JAX impl
+    """
+    if isinstance(module, nn.Linear):
+        if name.startswith('head'):
+            nn.init.zeros_(module.weight)
+            nn.init.constant_(module.bias, head_bias)
+        elif name.startswith('pre_logits'):
+            lecun_normal_(module.weight)
+            nn.init.zeros_(module.bias)
+        else:
+            if jax_impl:
+                nn.init.xavier_uniform_(module.weight)
+                if module.bias is not None:
+                    if 'mlp' in name:
+                        nn.init.normal_(module.bias, std=1e-6)
+                    else:
+                        nn.init.zeros_(module.bias)
+            else:
+                trunc_normal_(module.weight, std=.02)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+    elif jax_impl and isinstance(module, nn.Conv2d):
+        # NOTE conv was left to pytorch default in my original init
+        lecun_normal_(module.weight)
+        if module.bias is not None:
+            nn.init.zeros_(module.bias)
+    elif isinstance(module, (nn.LayerNorm, nn.GroupNorm, nn.BatchNorm2d)):
+        nn.init.zeros_(module.bias)
+        nn.init.ones_(module.weight)
 
 class DropPath(nn.Module):
     """Drop paths (Stochastic Depth) per sample  (when applied in main path of residual blocks).
@@ -139,7 +243,6 @@ class DropPath(nn.Module):
 
     def forward(self, x):
         return drop_path(x, self.drop_prob, self.training)
-
 
 class Mlp(nn.Module):
     """ MLP as used in Vision Transformer, MLP-Mixer and related networks
@@ -160,7 +263,6 @@ class Mlp(nn.Module):
         x = self.fc2(x)
         x = self.drop(x)
         return x
-
 
 class PatchEmbed(nn.Module):
     """ 2D Image to Patch Embedding
@@ -186,11 +288,11 @@ class PatchEmbed(nn.Module):
         x = self.norm(x)
         return x
 
-
 class Attention(nn.Module):
-    def __init__(self, dim, num_heads=8, qkv_bias=False, attn_drop=0., proj_drop=0., keep_rate=1., base_keep_rate=1., depth=0,save_tokens=0):
+    def __init__(self, dim, num_heads=8, qkv_bias=False, attn_drop=0., proj_drop=0., keep_rate=1., num_patches=0,base_keep_rate=1., depth=0,num_es_dt=0):
         super().__init__()
         self.num_heads = num_heads
+        self.num_patches = num_patches
         head_dim = dim // num_heads
         self.depth = depth
         self.scale = head_dim ** -0.5
@@ -200,137 +302,138 @@ class Attention(nn.Module):
         self.proj = nn.Linear(dim, dim)
         self.proj_drop = nn.Dropout(proj_drop)
         self.keep_rate = keep_rate
-        self.save_tokens=save_tokens
+        self.num_es_dt = num_es_dt
         assert 0 < keep_rate <= 1, "keep_rate must > 0 and <= 1, got {0}".format(keep_rate)
 
-        self.relative_position_bias_table = nn.Parameter(
-            torch.zeros(1, num_heads, 197 + self.save_tokens, 197 + self.save_tokens))  # 2*Wh-1 * 2*Ww-1, nH
+        self.rank_based_attn_bias = nn.Parameter(
+            torch.zeros(1, 1, self.num_patches + 1 + self.num_es_dt * 3, self.num_patches + 1 + self.num_es_dt * 3))  # 2*Wh-1 * 2*Ww-1, nH
 
-        trunc_normal_(self.relative_position_bias_table, std=.02)
-        if self.depth == 0:
-            self.gamma = nn.Parameter(torch.tensor([0.],requires_grad=True))
-            self.gamma_save = nn.Parameter(torch.tensor([0.],requires_grad=True))
-        else:
-            self.gamma = nn.Parameter(torch.tensor([0.5],requires_grad=True))
-            self.gamma_save = nn.Parameter(torch.tensor([0.5],requires_grad=True))
+        trunc_normal_(self.rank_based_attn_bias, std=.02)
 
-    def forward(self, x, keep_rate=None, tokens=None, alive_idx=None, last_attn=None):
+    def forward(self, x, keep_rate=None, tokens=None, alive_idx=None):
         if keep_rate is None:
             keep_rate = self.keep_rate
         B, N, C = x.shape
-        ST = self.save_tokens
+        DT = self.num_es_dt
         qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
         q, k, v = qkv[0], qkv[1], qkv[2]   # make torchscript happy (cannot use tensor as tuple)
 
         attn = (q @ k.transpose(-2, -1)) * self.scale
 
-        #! relative_position
-        relative_position_bias = self.relative_position_bias_table[:,:,:N,:N].expand(B,-1,-1,-1)
-        # relative_position_bias = relative_position_bias[:,:,:N,:N]
-        # relative_position_bias = torch.gather(relative_position_bias, dim=2, index=alive_idx.unsqueeze(1).unsqueeze(3).expand(-1,self.num_heads,-1,N))
-        attn_save = attn + relative_position_bias
-        self.gamma.data.clamp_(0., 1.)
-        self.gamma_save.data.clamp_(0., 1.)
-        if last_attn is not None:
-            attn = (1 - self.gamma) * attn_save + self.gamma * last_attn
-            last_attn = (1 - self.gamma_save) * attn_save + self.gamma_save * last_attn
-        else:
-            attn = attn_save
-            last_attn = attn_save
+        rank_based_attn_bias = self.rank_based_attn_bias[:,:,:N,:N]
+        attn = attn + rank_based_attn_bias
 
-        if self.depth > 3:
-            behind_tokens = math.ceil(self.base_keep_rate * (N - (ST + 1)))
-            attn[:,:,1:ST + 1,ST + 1:behind_tokens+ST + 1] = 0
+        if self.depth > 0 and self.depth <= 9:
+            leading_tokens = math.ceil(self.base_keep_rate * (N - (DT + 1)))
+            attn[:,:,1:DT + 1,DT + 1:leading_tokens + DT + 1] = 0
+
         attn = attn.softmax(dim=-1)
         attn = self.attn_drop(attn)
-        
+
         x = (attn @ v).transpose(1, 2).reshape(B, N, C)
         x = self.proj(x)
         x = self.proj_drop(x)
 
-        left_tokens = N - (ST + 1)
-        if self.keep_rate < 1 and keep_rate < 1 or tokens is not None:  # double check the keep rate
-            left_tokens = math.ceil(keep_rate * (N - (ST + 1)))
-            if tokens is not None:
-                left_tokens = tokens
-            if left_tokens == N - (ST + 1):
-                return x, None, None, None, left_tokens, alive_idx, last_attn
-            assert left_tokens >= 1
-            cls_attn = attn[:, :, 0, (ST + 1):]  # [B, H, N-1]
-            cls_attn = cls_attn.mean(dim=1)  # [B, N-1]
-            _, idx = torch.topk(cls_attn, left_tokens, dim=1, largest=True, sorted=True)  # [B, left_tokens]
-            # cls_idx = torch.zeros(B, 1, dtype=idx.dtype, device=idx.device)
-            # index = torch.cat([cls_idx, idx + 1], dim=1)
-            index = idx.unsqueeze(-1).expand(-1, -1, C)  # [B, left_tokens, C]
-
-            return x, index, idx, cls_attn, left_tokens, alive_idx, last_attn
-
-        return  x, None, None, None, left_tokens, alive_idx, last_attn
-
+        return x, attn, alive_idx
 
 class Block(nn.Module):
 
     def __init__(self, dim, num_heads, mlp_ratio=4., qkv_bias=False, drop=0., attn_drop=0.,
                  drop_path=0., act_layer=nn.GELU, norm_layer=nn.LayerNorm, keep_rate=0.,
-                 fuse_token=False, base_keep_rate=1., depth=12, save_tokens=0):
+                 fuse_token=False, base_keep_rate=1., depth=12, num_es_dt=0, num_patches=0):
         super().__init__()
         self.depth = depth
-        self.norm1 = norm_layer(dim)
+        self.num_patches = num_patches
         self.base_keep_rate=base_keep_rate
-        self.save_tokens=save_tokens
-        self.attn = Attention(dim, num_heads=num_heads, qkv_bias=qkv_bias,
-                              attn_drop=attn_drop, proj_drop=drop, keep_rate=keep_rate,base_keep_rate=self.base_keep_rate,depth=self.depth,save_tokens=self.save_tokens)
+        self.num_es_dt=num_es_dt
+
+        self.norm1 = norm_layer(dim)
+        self.attn = Attention(dim, num_heads=num_heads, qkv_bias=qkv_bias,num_patches=self.num_patches,
+                              attn_drop=attn_drop, proj_drop=drop, keep_rate=keep_rate,base_keep_rate=self.base_keep_rate,depth=self.depth,num_es_dt=self.num_es_dt)
         # NOTE: drop path for stochastic depth, we shall see if this is better than dropout here
         self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
         self.norm2 = norm_layer(dim)
         mlp_hidden_dim = int(dim * mlp_ratio)
         self.mlp = Mlp(in_features=dim, hidden_features=mlp_hidden_dim, act_layer=act_layer, drop=drop)
         self.keep_rate = keep_rate
-
         self.mlp_hidden_dim = mlp_hidden_dim
         self.fuse_token = fuse_token
+        if self.depth in [0,3,6]:
+            self.new_display_token = nn.Parameter(torch.zeros(1, self.num_es_dt, dim))
+            trunc_normal_(self.new_display_token, std=.02)
 
-    def forward(self, x, keep_rate=None, tokens=None, get_idx=False, alive_idx=None, last_attn=None):
+    def forward(self, x, keep_rate=None, tokens=None, get_idx=False, alive_idx=None):
         if keep_rate is None:
             keep_rate = self.keep_rate  # this is for inference, use the default keep rate
         B, N, C = x.shape
-        tmp, index, idx, cls_attn, left_tokens, alive_idx, last_attn = self.attn(self.norm1(x), keep_rate, tokens, alive_idx, last_attn)
-        x = x + self.drop_path(tmp)
+        DT = self.num_es_dt
+        tmpx, attn, alive_idx = self.attn(self.norm1(x), keep_rate, tokens, alive_idx)
+        x = x + self.drop_path(tmpx)
 
-        if index is not None:
-            # B, N, C = x.shape
-            ST = self.save_tokens
-            non_cls = x[:, ST + 1:]
-            dim4_index = idx.unsqueeze(1).unsqueeze(1).expand(-1, last_attn.shape[1], last_attn.shape[2], -1) # [B, left_tokens] [B, 1, 1, left_tokens]
-            last_attn = torch.cat((last_attn[:, :, :, 0:ST + 1],torch.gather(last_attn[:, :, :, ST + 1:], dim=3, index=dim4_index)),dim=3)
+        attn = attn.mean(dim=1) # [B, H, N, N] -> [B, N, N]
 
-            non_cls_last_attn = last_attn[:, :, ST + 1:]
-            x_others = torch.gather(non_cls, dim=1, index=index)  # [B, left_tokens, C]
-            dim3_index = idx.unsqueeze(1).unsqueeze(-1).expand(-1, last_attn.shape[1], -1, last_attn.shape[3]) # [B, left_tokens] [B, 1, left_tokens, 1]
-            last_attn_others = torch.gather(non_cls_last_attn, dim=2, index=dim3_index)
-            alive_idx = torch.cat((alive_idx[:, 0:ST + 1],torch.gather(alive_idx, dim=1, index=idx)),dim=1)
+        # NOTE: 先裁剪，然后在中间插入新的4个token
+        if self.depth in [0]:
+            
+            mean_attn = attn[:, :, 1:].mean(dim=1) #[B, N, N-DT-1] -> #[B, N-DT-1]
+            _, idx = torch.topk(mean_attn, N - 1, dim=1, largest=True, sorted=True)  # [B, ratio * (N-DT-1)]
 
-            if self.fuse_token:
-                compl = complement_idx(idx, N - (ST + 1))  # [B, N-1-left_tokens]
-                non_topk = torch.gather(non_cls, dim=1, index=compl.unsqueeze(-1).expand(-1, -1, C))  # [B, N-1-left_tokens, C]
-                # non_topk = batch_index_select(non_cls, compl)
+            x_img = x[:, 1:] # [B, N-DT-1, C]
+            # x_dense = batch_index_select(x_img, idx) # [B, N-DT-1, C] -> # [B, ratio * (N-DT-1), C]
+            x_dense = torch.gather(x_img, dim=1, index=idx.unsqueeze(-1).expand(-1, -1, C))
+            x_dt = self.new_display_token.expand(x.shape[0],-1,-1)
 
-                non_topk_attn = torch.gather(cls_attn, dim=1, index=compl)  # [B, N-1-left_tokens]
-                non_topk_last_attn = torch.gather(non_cls_last_attn, dim=2, index=compl)
-                extra_token = torch.sum(non_topk * non_topk_attn.unsqueeze(-1), dim=1, keepdim=True)  # [B, 1, C]
-                extra_last_attn = torch.sum(non_topk * non_topk_last_attn.unsqueeze(-1), dim=2, keepdim=True)  # [B, 1, C]
-                x = torch.cat([x[:, 0:ST + 1], x_others, extra_token], dim=1)
-                last_attn = torch.cat([last_attn[:, :, 0:ST + 1], last_attn_others, extra_last_attn], dim=2)
+            x = torch.cat([x[:, 0:1], x_dt, x_dense], dim=1)
+
+            #! 错的，还没改
+            # alive_idx = torch.cat((alive_idx[:, 0:DT+1],torch.gather(alive_idx[:,DT+1:], dim=1, index=idx)),dim=1)
+
+        elif self.depth in [3,6,9]:
+            # if self.keep_rate < 1 and keep_rate < 1 or tokens is not None:  # double check the keep rate
+            # 所谓的double check，其实是因为keep_rate在每层都是0.7，除了shrink阶段。相当于self.keep_rate只起到了01的作用
+            left_tokens = math.ceil(keep_rate * (N - (DT + 1)))
+            if tokens is not None:
+                left_tokens = tokens
+
+            cls_attn = attn[:, 0, (DT + 1):]  # [B, N, N] -> [B, N-DT-1]
+            _, idx = torch.topk(cls_attn, left_tokens, dim=1, largest=True, sorted=True)  # [B, ratio * (N-DT-1)]
+
+            x_img = x[:, DT + 1:] # [B, N-DT-1, C]
+            # x_dense = batch_index_select(x_img, idx) # [B, N-DT-1, C] -> # [B, ratio * (N-DT-1), C]
+            x_dense = torch.gather(x_img, dim=1, index=idx.unsqueeze(-1).expand(-1, -1, C))
+
+            # alive_idx = torch.cat((alive_idx[:, 0:DT+1],torch.gather(alive_idx[:,DT+1:], dim=1, index=idx)),dim=1)
+
+            if self.fuse_token and idx.shape[1] != x_img.shape[1]:
+                #! 错的，还没改
+                compl = complement_idx(idx, N - (DT + 1))  # [B, (1-ratio) * (N-DT-1)]
+                # x_sparse = batch_index_select(x_img, compl)# [B, (N-DT-1),C] -> # [B, (1-ratio) * (N-DT-1),C]
+                x_sparse = torch.gather(x_img, dim=1, index=compl.unsqueeze(-1).expand(-1, -1, C))  # [B, (1-ratio) * (N-ST-1), C]
+                
+                # sparse_weight = batch_index_select(cls_attn, compl) # [B, (N-DT-1)] -> # [B, (1-ratio) * (N-DT-1)]
+                sparse_weight = torch.gather(cls_attn, dim=1, index=compl)  # [B, N-1-left_tokens] # [B, (N-ST-1)] -> # [B, (1-ratio) * (N-ST-1)]
+                extra_token = torch.sum(x_sparse * sparse_weight.unsqueeze(-1), dim=1, keepdim=True)  # [B, 1, C]
+
+                if self.depth in [3,6]:
+                    x_dt = self.new_display_token.expand(x.shape[0],-1,-1)
+                    x = torch.cat([x[:, 0:1], x_dt, x[:,1:DT+1], extra_token, x_dense], dim=1)
+                else:
+                    x = torch.cat([x[:, 0:DT+1], extra_token, x_dense], dim=1)
+
+                # extra_idx = (self.num_patches + 1 + DT) + (self.depth + 1)
+                # alive_idx = torch.cat((alive_idx,torch.Tensor([extra_idx]).cuda().unsqueeze(0).expand(B,-1)),dim=1)
             else:
-                x = torch.cat([x[:, 0:ST + 1], x_others], dim=1)
-                last_attn = torch.cat([last_attn[:, :, 0:ST + 1], last_attn_others], dim=2)
+                if self.depth in [3,6]:
+                    x_dt = self.new_display_token.expand(x.shape[0],-1,-1)
+                    x = torch.cat([x[:, 0:1], x_dt, x[:,1:DT+1],x_dense], dim=1)
+                else:
+                    x = torch.cat([x[:, 0:DT+1], x_dense], dim=1)
 
         x = x + self.drop_path(self.mlp(self.norm2(x)))
-        # print(alive_idx)
-        n_tokens = x.shape[1] - (self.save_tokens + 1)
-        if get_idx and index is not None:
-            return x, n_tokens, idx, alive_idx, last_attn 
-        return x, n_tokens, None, alive_idx, last_attn 
+        n_tokens = x.shape[1] - 1
+        if get_idx and idx is not None:
+            return x, n_tokens, idx, alive_idx
+        return x, n_tokens, None, alive_idx
 
 class EViT(nn.Module):
     """ EViT """
@@ -338,7 +441,7 @@ class EViT(nn.Module):
     def __init__(self, img_size=224, patch_size=16, in_chans=3, num_classes=1000, embed_dim=768, depth=12,
                  num_heads=12, mlp_ratio=4., qkv_bias=True, representation_size=None, distilled=False,
                  drop_rate=0., attn_drop_rate=0., drop_path_rate=0., embed_layer=PatchEmbed, norm_layer=None,
-                 act_layer=None, weight_init='', keep_rate=(1, ), fuse_token=False, base_keep_rate=1., save_tokens=0):
+                 act_layer=None, weight_init='', keep_rate=(1, ), fuse_token=False, base_keep_rate=1., num_es_dt=0):
         """
         Args:
             img_size (int, tuple): input image size
@@ -365,43 +468,33 @@ class EViT(nn.Module):
             keep_rate = keep_rate * depth
         self.keep_rate = keep_rate
         self.depth = depth
-        self.first_shrink_idx = depth
         self.base_keep_rate=base_keep_rate
-        self.save_tokens = save_tokens
-        for i, s in enumerate(keep_rate):
-            if s < 1:
-                self.first_shrink_idx = i
-                break
+        self.num_es_dt = num_es_dt
         self.num_classes = num_classes
         self.num_features = self.embed_dim = embed_dim  # num_features for consistency with other models
-        self.num_tokens = self.save_tokens + 2 if distilled else self.save_tokens + 1
+        self.num_tokens = 2 if distilled else 1
         norm_layer = norm_layer or partial(nn.LayerNorm, eps=1e-6)
         act_layer = act_layer or nn.GELU
 
         self.patch_embed = embed_layer(
             img_size=img_size, patch_size=patch_size, in_chans=in_chans, embed_dim=embed_dim)
-        num_patches = self.patch_embed.num_patches
+        self.num_patches = self.patch_embed.num_patches
 
-        self.cls_token = nn.Parameter(torch.zeros(1, self.save_tokens + 1, embed_dim))
+        self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
         self.dist_token = nn.Parameter(torch.zeros(1, 1, embed_dim)) if distilled else None
-        self.pos_embed = nn.Parameter(torch.zeros(1, num_patches + self.num_tokens, embed_dim))
+        self.pos_embed = nn.Parameter(torch.zeros(1, self.num_patches + self.num_tokens, embed_dim))
         self.pos_drop = nn.Dropout(p=drop_rate)
 
         dpr = [x.item() for x in torch.linspace(0, drop_path_rate, depth)]  # stochastic depth decay rule
         self.blocks = nn.ModuleList([
             Block(
                 dim=embed_dim, num_heads=num_heads, mlp_ratio=mlp_ratio, qkv_bias=qkv_bias, drop=drop_rate,
-                attn_drop=attn_drop_rate, drop_path=dpr[i], norm_layer=norm_layer, act_layer=act_layer,
-                keep_rate=keep_rate[i], fuse_token=fuse_token, base_keep_rate=self.base_keep_rate, depth=i, save_tokens=self.save_tokens)
+                attn_drop=attn_drop_rate, drop_path=dpr[i], norm_layer=norm_layer, act_layer=act_layer,num_patches=self.num_patches,
+                keep_rate=keep_rate[i], fuse_token=fuse_token, base_keep_rate=self.base_keep_rate, depth=i, num_es_dt=self.num_es_dt)
             for i in range(depth)])
         self.norm = norm_layer(embed_dim)
 
         # Representation layer
-        self.neck = nn.Sequential(
-            nn.Linear(embed_dim, embed_dim),
-            nn.LayerNorm(embed_dim),
-            nn.GELU()
-        )
         if representation_size and not distilled:
             self.num_features = representation_size
             self.pre_logits = nn.Sequential(OrderedDict([
@@ -410,7 +503,13 @@ class EViT(nn.Module):
             ]))
         else:
             self.pre_logits = nn.Identity()
-
+        
+        # Representation layer
+        self.neck = nn.Sequential(
+            nn.Linear(embed_dim, embed_dim),
+            nn.LayerNorm(embed_dim),
+            nn.GELU()
+        )
         # Classifier head(s)
         self.head = nn.Linear(self.num_features, num_classes) if num_classes > 0 else nn.Identity()
         self.head_dist = None
@@ -493,19 +592,17 @@ class EViT(nn.Module):
         left_tokens = []
         idxs = []
         alive_idx = torch.arange(x.shape[1], device=x.device).expand(x.shape[0], -1)
-        last_attn = None
         for i, blk in enumerate(self.blocks):
-            x, left_token, idx, alive_idx, last_attn = blk(x, keep_rate[i], tokens[i], get_idx, alive_idx, last_attn)
+            x, left_token, idx, alive_idx = blk(x, keep_rate[i], tokens[i], get_idx, alive_idx)
             left_tokens.append(left_token)
             if idx is not None:
                 idxs.append(idx)
         x = self.norm(x)
         x = self.neck(x)
         if self.dist_token is None:
-
             return self.pre_logits(x[:, 0]), left_tokens, idxs
         else:
-            return x[:, 0], x[:, self.save_tokens+1], idxs
+            return x[:, 0], x[:, 1], idxs
 
     def forward(self, x, keep_rate=None, tokens=None, get_idx=False):
         x, _, idxs = self.forward_features(x, keep_rate, tokens, get_idx)
@@ -521,40 +618,6 @@ class EViT(nn.Module):
         if get_idx:
             return x, idxs
         return x
-
-def _init_vit_weights(module: nn.Module, name: str = '', head_bias: float = 0., jax_impl: bool = False):
-    """ ViT weight initialization
-    * When called without n, head_bias, jax_impl args it will behave exactly the same
-      as my original init for compatibility with prev hparam / downstream use cases (ie DeiT).
-    * When called w/ valid n (module name) and jax_impl=True, will (hopefully) match JAX impl
-    """
-    if isinstance(module, nn.Linear):
-        if name.startswith('head'):
-            nn.init.zeros_(module.weight)
-            nn.init.constant_(module.bias, head_bias)
-        elif name.startswith('pre_logits'):
-            lecun_normal_(module.weight)
-            nn.init.zeros_(module.bias)
-        else:
-            if jax_impl:
-                nn.init.xavier_uniform_(module.weight)
-                if module.bias is not None:
-                    if 'mlp' in name:
-                        nn.init.normal_(module.bias, std=1e-6)
-                    else:
-                        nn.init.zeros_(module.bias)
-            else:
-                trunc_normal_(module.weight, std=.02)
-                if module.bias is not None:
-                    nn.init.zeros_(module.bias)
-    elif jax_impl and isinstance(module, nn.Conv2d):
-        # NOTE conv was left to pytorch default in my original init
-        lecun_normal_(module.weight)
-        if module.bias is not None:
-            nn.init.zeros_(module.bias)
-    elif isinstance(module, (nn.LayerNorm, nn.GroupNorm, nn.BatchNorm2d)):
-        nn.init.zeros_(module.bias)
-        nn.init.ones_(module.weight)
 
 @torch.no_grad()
 def _load_weights(model: EViT, checkpoint_path: str, prefix: str = ''):
@@ -635,85 +698,21 @@ def _load_weights(model: EViT, checkpoint_path: str, prefix: str = ''):
         block.norm2.weight.copy_(_n2p(w[f'{block_prefix}LayerNorm_2/scale']))
         block.norm2.bias.copy_(_n2p(w[f'{block_prefix}LayerNorm_2/bias']))
 
-def resize_pos_embed(posemb, posemb_new, num_tokens=1, gs_new=()):
-    # Rescale the grid of position embeddings when loading from state_dict. Adapted from
-    # https://github.com/google-research/vision_transformer/blob/00883dd691c63a6830751563748663526e811cee/vit_jax/checkpoint.py#L224
-    _logger.info('Resized position embedding: %s to %s', posemb.shape, posemb_new.shape)
-    ntok_new = posemb_new.shape[1]
-    if num_tokens:
-        posemb_tok, posemb_grid = posemb[:, :num_tokens], posemb[0, num_tokens:]
-        ntok_new -= num_tokens
-    else:
-        posemb_tok, posemb_grid = posemb[:, :0], posemb[0]
-    gs_old = int(math.sqrt(len(posemb_grid)))
-    if not len(gs_new):  # backwards compatibility
-        gs_new = [int(math.sqrt(ntok_new))] * 2
-    assert len(gs_new) >= 2
-    _logger.info('Position embedding grid-size from %s to %s', [gs_old, gs_old], gs_new)
-    posemb_grid = posemb_grid.reshape(1, gs_old, gs_old, -1).permute(0, 3, 1, 2)
-    posemb_grid = F.interpolate(posemb_grid, size=gs_new, mode='bicubic', align_corners=False)
-    posemb_grid = posemb_grid.permute(0, 2, 3, 1).reshape(1, gs_new[0] * gs_new[1], -1)
-    posemb = torch.cat([posemb_tok, posemb_grid], dim=1)
-    return posemb
-
-def checkpoint_filter_fn(state_dict, model):
-    """ convert patch embedding weight from manual patchify + linear proj to conv"""
-    out_dict = {}
-    if 'model' in state_dict:
-        # For deit models
-        state_dict = state_dict['model']
-    for k, v in state_dict.items():
-        if 'patch_embed.proj.weight' in k and len(v.shape) < 4:
-            # For old models that I trained prior to conv based patchification
-            O, I, H, W = model.patch_embed.proj.weight.shape
-            v = v.reshape(O, -1, H, W)
-        elif k == 'pos_embed' and v.shape != model.pos_embed.shape:
-            # To resize pos embedding when using model at different size from pretrained weights
-            v = resize_pos_embed(
-                v, model.pos_embed, getattr(model, 'num_tokens', 1), model.patch_embed.grid_size)
-        out_dict[k] = v
-    return out_dict
-
-def _create_evit(variant, pretrained=False, default_cfg=None, **kwargs):
-    default_cfg = default_cfg or default_cfgs[variant]
-    default_cfg.update(kwargs)
-    if kwargs.get('features_only', None):
-        raise RuntimeError('features_only not implemented for Vision Transformer models.')
-
-    # NOTE this extra code to support handling of repr size for in21k pretrained models
-    default_num_classes = default_cfg['num_classes']
-    num_classes = kwargs.get('num_classes', default_num_classes)
-    repr_size = kwargs.pop('representation_size', None)
-    if repr_size is not None and num_classes != default_num_classes:
-        # Remove representation layer if fine-tuning. This may not always be the desired action,
-        # but I feel better than doing nothing by default for fine-tuning. Perhaps a better interface?
-        _logger.warning("Removing representation layer for fine-tuning.")
-        repr_size = None
-
-    model = build_model_with_cfg(
-        EViT, variant, pretrained,
-        default_cfg=default_cfg,
-        representation_size=repr_size,
-        pretrained_filter_fn=checkpoint_filter_fn,
-        pretrained_custom_load='npz' in default_cfg['url'],
-        **kwargs)
-    return model
-
 # -------------------------------------------------------------
 # EViT prototype models
 @register_model
-def deit_small_patch16_shrink_base_lral_lfb_4sto_fix01(pretrained=False, base_keep_rate=0.7, drop_loc=(3, 6, 9), **kwargs):
+def SvitS_224_r4_1rb_e4sto_neck_gather(pretrained=False, base_keep_rate=0.7, drop_loc=(3, 6, 9), **kwargs):
     keep_rate = [1] * 12
     for loc in drop_loc:
         keep_rate[loc] = base_keep_rate
-    model_kwargs = dict(patch_size=16, embed_dim=384, depth=12, num_heads=6, keep_rate=keep_rate, base_keep_rate=base_keep_rate, save_tokens=4)
+    model_kwargs = dict(patch_size=16, embed_dim=384, depth=12, num_heads=6, keep_rate=keep_rate, base_keep_rate=base_keep_rate, num_es_dt=4)
     model_kwargs.update(kwargs)
     model = _create_evit('deit_small_patch16_224', pretrained=pretrained, **model_kwargs)
     return model
 
 if __name__ == "__main__":
 
-    model = deit_small_patch16_shrink_base_lral_lfb_4sto_fix01(base_keep_rate=0.7)
+    model = SvitS_224_r4_1rb_e4sto_neck_gather(base_keep_rate=0.7)
     img_size = 224
     x = torch.randn(16, 3, img_size, img_size)
     model(x)

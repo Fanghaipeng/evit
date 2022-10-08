@@ -161,7 +161,6 @@ class Mlp(nn.Module):
         x = self.drop(x)
         return x
 
-
 class PatchEmbed(nn.Module):
     """ 2D Image to Patch Embedding
     """
@@ -186,7 +185,6 @@ class PatchEmbed(nn.Module):
         x = self.norm(x)
         return x
 
-
 class Attention(nn.Module):
     def __init__(self, dim, num_heads=8, qkv_bias=False, attn_drop=0., proj_drop=0., keep_rate=1., base_keep_rate=1., depth=0,save_tokens=0):
         super().__init__()
@@ -207,14 +205,8 @@ class Attention(nn.Module):
             torch.zeros(1, num_heads, 197 + self.save_tokens, 197 + self.save_tokens))  # 2*Wh-1 * 2*Ww-1, nH
 
         trunc_normal_(self.relative_position_bias_table, std=.02)
-        if self.depth == 0:
-            self.gamma = nn.Parameter(torch.tensor([0.],requires_grad=True))
-            self.gamma_save = nn.Parameter(torch.tensor([0.],requires_grad=True))
-        else:
-            self.gamma = nn.Parameter(torch.tensor([0.5],requires_grad=True))
-            self.gamma_save = nn.Parameter(torch.tensor([0.5],requires_grad=True))
 
-    def forward(self, x, keep_rate=None, tokens=None, alive_idx=None, last_attn=None):
+    def forward(self, x, keep_rate=None, tokens=None, alive_idx=None):
         if keep_rate is None:
             keep_rate = self.keep_rate
         B, N, C = x.shape
@@ -228,33 +220,34 @@ class Attention(nn.Module):
         relative_position_bias = self.relative_position_bias_table[:,:,:N,:N].expand(B,-1,-1,-1)
         # relative_position_bias = relative_position_bias[:,:,:N,:N]
         # relative_position_bias = torch.gather(relative_position_bias, dim=2, index=alive_idx.unsqueeze(1).unsqueeze(3).expand(-1,self.num_heads,-1,N))
-        attn_save = attn + relative_position_bias
-        self.gamma.data.clamp_(0., 1.)
-        self.gamma_save.data.clamp_(0., 1.)
-        if last_attn is not None:
-            attn = (1 - self.gamma) * attn_save + self.gamma * last_attn
-            last_attn = (1 - self.gamma_save) * attn_save + self.gamma_save * last_attn
-        else:
-            attn = attn_save
-            last_attn = attn_save
-
-        if self.depth > 3:
+        attn = attn + relative_position_bias
+        if self.depth > 0 and self.depth <= 9:
             behind_tokens = math.ceil(self.base_keep_rate * (N - (ST + 1)))
             attn[:,:,1:ST + 1,ST + 1:behind_tokens+ST + 1] = 0
+        if self.depth > 9:
+            attn[:,:,1:ST + 1,ST + 1:N - 1] = 0
         attn = attn.softmax(dim=-1)
         attn = self.attn_drop(attn)
-        
+
         x = (attn @ v).transpose(1, 2).reshape(B, N, C)
         x = self.proj(x)
         x = self.proj_drop(x)
 
         left_tokens = N - (ST + 1)
+        if self.depth in [0]:
+            cls_attn = attn[:, :, (ST + 1):, (ST + 1):]  # [B, H, N-ST-1, N-ST-1]
+            cls_attn = cls_attn.mean(dim=2)  # [B, H, N-ST-1]
+            cls_attn = cls_attn.mean(dim=1)  # [B, N-ST-1]
+            _, idx = torch.topk(cls_attn, left_tokens, dim=1, largest=True, sorted=True)  # [B, left_tokens]
+            index = idx.unsqueeze(-1).expand(-1, -1, C)  # [B, left_tokens, C]
+
+            return x, index, idx, cls_attn, left_tokens, alive_idx
         if self.keep_rate < 1 and keep_rate < 1 or tokens is not None:  # double check the keep rate
             left_tokens = math.ceil(keep_rate * (N - (ST + 1)))
             if tokens is not None:
                 left_tokens = tokens
             if left_tokens == N - (ST + 1):
-                return x, None, None, None, left_tokens, alive_idx, last_attn
+                return x, None, None, None, left_tokens, alive_idx
             assert left_tokens >= 1
             cls_attn = attn[:, :, 0, (ST + 1):]  # [B, H, N-1]
             cls_attn = cls_attn.mean(dim=1)  # [B, N-1]
@@ -263,9 +256,9 @@ class Attention(nn.Module):
             # index = torch.cat([cls_idx, idx + 1], dim=1)
             index = idx.unsqueeze(-1).expand(-1, -1, C)  # [B, left_tokens, C]
 
-            return x, index, idx, cls_attn, left_tokens, alive_idx, last_attn
+            return x, index, idx, cls_attn, left_tokens, alive_idx
 
-        return  x, None, None, None, left_tokens, alive_idx, last_attn
+        return  x, None, None, None, left_tokens, alive_idx
 
 
 class Block(nn.Module):
@@ -290,47 +283,38 @@ class Block(nn.Module):
         self.mlp_hidden_dim = mlp_hidden_dim
         self.fuse_token = fuse_token
 
-    def forward(self, x, keep_rate=None, tokens=None, get_idx=False, alive_idx=None, last_attn=None):
+    def forward(self, x, keep_rate=None, tokens=None, get_idx=False, alive_idx=None):
         if keep_rate is None:
             keep_rate = self.keep_rate  # this is for inference, use the default keep rate
         B, N, C = x.shape
-        tmp, index, idx, cls_attn, left_tokens, alive_idx, last_attn = self.attn(self.norm1(x), keep_rate, tokens, alive_idx, last_attn)
+
+        tmp, index, idx, cls_attn, left_tokens, alive_idx = self.attn(self.norm1(x), keep_rate, tokens, alive_idx)
         x = x + self.drop_path(tmp)
 
         if index is not None:
             # B, N, C = x.shape
             ST = self.save_tokens
             non_cls = x[:, ST + 1:]
-            dim4_index = idx.unsqueeze(1).unsqueeze(1).expand(-1, last_attn.shape[1], last_attn.shape[2], -1) # [B, left_tokens] [B, 1, 1, left_tokens]
-            last_attn = torch.cat((last_attn[:, :, :, 0:ST + 1],torch.gather(last_attn[:, :, :, ST + 1:], dim=3, index=dim4_index)),dim=3)
-
-            non_cls_last_attn = last_attn[:, :, ST + 1:]
             x_others = torch.gather(non_cls, dim=1, index=index)  # [B, left_tokens, C]
-            dim3_index = idx.unsqueeze(1).unsqueeze(-1).expand(-1, last_attn.shape[1], -1, last_attn.shape[3]) # [B, left_tokens] [B, 1, left_tokens, 1]
-            last_attn_others = torch.gather(non_cls_last_attn, dim=2, index=dim3_index)
-            alive_idx = torch.cat((alive_idx[:, 0:ST + 1],torch.gather(alive_idx, dim=1, index=idx)),dim=1)
 
+            alive_idx = torch.cat((alive_idx[:, 0:ST + 1],torch.gather(alive_idx[:, ST + 1:], dim=1, index=idx)),dim=1)
             if self.fuse_token:
                 compl = complement_idx(idx, N - (ST + 1))  # [B, N-1-left_tokens]
                 non_topk = torch.gather(non_cls, dim=1, index=compl.unsqueeze(-1).expand(-1, -1, C))  # [B, N-1-left_tokens, C]
                 # non_topk = batch_index_select(non_cls, compl)
 
                 non_topk_attn = torch.gather(cls_attn, dim=1, index=compl)  # [B, N-1-left_tokens]
-                non_topk_last_attn = torch.gather(non_cls_last_attn, dim=2, index=compl)
                 extra_token = torch.sum(non_topk * non_topk_attn.unsqueeze(-1), dim=1, keepdim=True)  # [B, 1, C]
-                extra_last_attn = torch.sum(non_topk * non_topk_last_attn.unsqueeze(-1), dim=2, keepdim=True)  # [B, 1, C]
                 x = torch.cat([x[:, 0:ST + 1], x_others, extra_token], dim=1)
-                last_attn = torch.cat([last_attn[:, :, 0:ST + 1], last_attn_others, extra_last_attn], dim=2)
             else:
                 x = torch.cat([x[:, 0:ST + 1], x_others], dim=1)
-                last_attn = torch.cat([last_attn[:, :, 0:ST + 1], last_attn_others], dim=2)
-
+        # print(alive_idx)
         x = x + self.drop_path(self.mlp(self.norm2(x)))
         # print(alive_idx)
         n_tokens = x.shape[1] - (self.save_tokens + 1)
         if get_idx and index is not None:
-            return x, n_tokens, idx, alive_idx, last_attn 
-        return x, n_tokens, None, alive_idx, last_attn 
+            return x, n_tokens, idx, alive_idx
+        return x, n_tokens, None, alive_idx
 
 class EViT(nn.Module):
     """ EViT """
@@ -493,9 +477,8 @@ class EViT(nn.Module):
         left_tokens = []
         idxs = []
         alive_idx = torch.arange(x.shape[1], device=x.device).expand(x.shape[0], -1)
-        last_attn = None
         for i, blk in enumerate(self.blocks):
-            x, left_token, idx, alive_idx, last_attn = blk(x, keep_rate[i], tokens[i], get_idx, alive_idx, last_attn)
+            x, left_token, idx, alive_idx = blk(x, keep_rate[i], tokens[i], get_idx, alive_idx)
             left_tokens.append(left_token)
             if idx is not None:
                 idxs.append(idx)
@@ -702,7 +685,7 @@ def _create_evit(variant, pretrained=False, default_cfg=None, **kwargs):
 # -------------------------------------------------------------
 # EViT prototype models
 @register_model
-def deit_small_patch16_shrink_base_lral_lfb_4sto_fix01(pretrained=False, base_keep_rate=0.7, drop_loc=(3, 6, 9), **kwargs):
+def deit_small_patch16_shrink_base_r4_tt0_lfb_4sto_nl(pretrained=False, base_keep_rate=0.7, drop_loc=(3, 6, 9), **kwargs):
     keep_rate = [1] * 12
     for loc in drop_loc:
         keep_rate[loc] = base_keep_rate
@@ -713,7 +696,8 @@ def deit_small_patch16_shrink_base_lral_lfb_4sto_fix01(pretrained=False, base_ke
 
 if __name__ == "__main__":
 
-    model = deit_small_patch16_shrink_base_lral_lfb_4sto_fix01(base_keep_rate=0.7)
+    model = deit_small_patch16_shrink_base_r4_tt0_lfb_4sto_nl(base_keep_rate=0.7)
+    # flops = calc_flops(model, img_size=224)
     img_size = 224
-    x = torch.randn(16, 3, img_size, img_size)
+    x = torch.randn(1, 3, img_size, img_size)
     model(x)

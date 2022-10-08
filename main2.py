@@ -24,51 +24,16 @@ from timm.utils import NativeScaler, get_state_dict, ModelEma
 
 from datasets import build_dataset
 from engine import train_one_epoch, evaluate, visualize_mask
-from losses import DistillationLoss, DistillationLoss_SL
+from losses import DistillationLoss
 from samplers import RASampler
 import models
 import utils
 from helpers import speed_test, get_macs
 
-import evit_lral_lfb_4sto_fix01
-import evit_lra_lfb_4sto_fix01
-import evit_r4_lfb_4sto
-import evit_lral_lfb_8sto_fix01
-
-import evit_lfb_4st
-import evit_lfb_4sto
-import evit_lfb_4sto_nk
-import evit_r4_tt0_lfb_4sto
-
-import evit_lfbo_4sto
-
-import Svit_r4_1rb_4sto
-import Svit_r3_1rb_4sto
-import Svit_r4_6rb_4sto
-import Svit_r4_raww_1rb_4sto
-
-import Svit_r4_1rb_e4sto
-import Svit_r4_6rb_e4sto
-import Svit_r3_6rb_4sto_neck
-import Svit_r3_6rb_4sto_neck_gather
-import Svit_r4_1rb_e4sto_neck_gather
-import Svit_r4_1rb_e4sto_gather
-import Svit_r3_6rb_4sto_neck_rploss
-import Svit_r4_1rb_e4sto_neck_rploss
-import Svit_r3_6rb_4st_neck_rploss
-import Svit_re_6rb_4st_neck_rploss
-import Svit_r3_6rb_4sto_neck_rploss_fd
-import Svit_re_6rb_4st_neck_rploss
-import Svit_re_6rb_4sto_neck_rploss
-import Svit_r3_6rb_4stom5_neck_rploss
-import Svit_r3_6rb_4cls_cp4sto_neck_rploss
-import Svit_r3_rcgg_6rb_4sto_neck_rploss
-
 from tensorboardX import SummaryWriter
 import warnings
 warnings.filterwarnings('ignore', 'Argument interpolation should be of type InterpolationMode instead of int')
 
-# torch.autograd.set_detect_anomaly(True)
 
 def get_args_parser():
     parser = argparse.ArgumentParser('DeiT training and evaluation script', add_help=False)
@@ -81,7 +46,7 @@ def get_args_parser():
     parser.add_argument('--fuse_token', action='store_true', help='whether to fuse the inattentive tokens')
     parser.add_argument('--base_keep_rate', type=float, default=0.7,
                         help='Base keep rate (default: 0.7)')
-    parser.add_argument('--shrink_epochs', default=100, type=int, 
+    parser.add_argument('--shrink_epochs', default=0, type=int, 
                         help='how many epochs to perform gradual shrinking of inattentive tokens')
     parser.add_argument('--shrink_start_epoch', default=10, type=int, 
                         help='on which epoch to start shrinking of inattentive tokens')
@@ -89,7 +54,7 @@ def get_args_parser():
                         help='the layer indices for shrinking inattentive tokens')
 
     # Model parameters
-    parser.add_argument('--model', default='SvitS_224_r3_6rb_4sto_neck_rploss', type=str, metavar='MODEL',
+    parser.add_argument('--model', default='deit_base_patch16_224', type=str, metavar='MODEL',
                         help='Name of model to train')
     parser.add_argument('--input-size', default=224, type=int, help='images input size')
 
@@ -194,7 +159,7 @@ def get_args_parser():
     parser.add_argument('--finetune', default='', help='finetune from checkpoint')
 
     # Dataset parameters
-    parser.add_argument('--data-path', default='/apsarapangu/disk2/fanghaipeng.fhp/CVPR/data/imagenet/', type=str,
+    parser.add_argument('--data-path', default='/datasets01/imagenet_full_size/061417/', type=str,
                         help='dataset path')
     parser.add_argument('--data-set', default='IMNET', choices=['CIFAR', 'IMNET', 'INAT', 'INAT19'],
                         type=str, help='Image Net dataset path')
@@ -207,7 +172,6 @@ def get_args_parser():
                         help='path where to save, empty for no saving')
     parser.add_argument('--device', default='cuda',
                         help='device to use for training / testing')
-    # parser.add_argument('--seed', default=3407, type=int)
     parser.add_argument('--seed', default=0, type=int)
     parser.add_argument('--resume', default='', help='resume from checkpoint')
     parser.add_argument('--start_epoch', default=0, type=int, metavar='N',
@@ -242,7 +206,6 @@ def main(args):
 
     # fix the seed for reproducibility
     seed = args.seed + utils.get_rank()
-    # seed = args.seed
     torch.manual_seed(seed)
     np.random.seed(seed)
     # random.seed(seed)
@@ -389,8 +352,6 @@ def main(args):
 
     model_without_ddp = model
     if args.distributed:
-        # model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu], broadcast_buffers=False)
-        # model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu],find_unused_parameters=True)
         model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu])
         model_without_ddp = model.module
     n_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -437,7 +398,7 @@ def main(args):
 
     # wrap the criterion in our custom DistillationLoss, which
     # just dispatches to the original criterion if args.distillation_type is 'none'
-    criterion = DistillationLoss_SL(
+    criterion = DistillationLoss(
         criterion, teacher_model, args.distillation_type, args.distillation_alpha, args.distillation_tau
     )
 
@@ -501,7 +462,7 @@ def main(args):
                     'args': args,
                 }, checkpoint_path)
 
-        test_interval = 1
+        test_interval = 30
         if epoch % test_interval == 0 or epoch == args.epochs - 1:
             test_stats = evaluate(data_loader_val, model, device, keep_rate)
             print(f"Accuracy of the network on the {len(dataset_val)} test images: {test_stats['acc1']:.1f}%")
@@ -510,12 +471,6 @@ def main(args):
             test_stats1 = {f'test_{k}': v for k, v in test_stats.items()}
         else:
             test_stats1 = {}
-            
-        for name,p in model.named_parameters():
-            if "gamma" in name:
-                print(name,p[0])
-            elif "theta" in name:
-                print(name,torch.sigmoid(p[0]))
 
         log_stats = {**{f'train_{k}': v for k, v in train_stats.items()},
                      **test_stats1,
